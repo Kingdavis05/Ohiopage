@@ -1,0 +1,17 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Admin — Ohio Auto Parts</title></head>
+<body>
+<h1>Admin — Orders</h1>
+<p>Enter password to load orders:</p>
+<input id="pwd" placeholder="password"/><button id="load">Load</button>
+<div id="orders"></div>
+<script>
+document.getElementById('load').addEventListener('click', async ()=>{
+  const pwd = document.getElementById('pwd').value;
+  const res = await fetch('/admin/orders?pwd='+encodeURIComponent(pwd));
+  if (res.status===403){ alert('Forbidden'); return; }
+  const orders = await res.json();
+  document.getElementById('orders').innerHTML = '<pre>'+JSON.stringify(orders,null,2)+'</pre>';
+});
+</script>
+</body></html>

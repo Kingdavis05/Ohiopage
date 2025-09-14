@@ -1,0 +1,33 @@
+{
+  "products": [
+    {
+      "id": "p1",
+      "title": "Brake Pads \u2014 Front (Set)",
+      "price": 49.99,
+      "category": "Brakes",
+      "description": "High-quality front brake pads."
+    },
+    {
+      "id": "p2",
+      "title": "Oil Filter \u2014 Universal",
+      "price": 9.99,
+      "category": "Engine",
+      "description": "Fits most passenger cars."
+    },
+    {
+      "id": "p3",
+      "title": "Air Filter \u2014 Standard",
+      "price": 15.5,
+      "category": "Engine",
+      "description": "Improves air flow and efficiency."
+    },
+    {
+      "id": "p4",
+      "title": "Spark Plug \u2014 Premium (4)",
+      "price": 24.99,
+      "category": "Ignition",
+      "description": "Long-life spark plugs, pack of 4."
+    }
+  ],
+  "orders": []
+}
