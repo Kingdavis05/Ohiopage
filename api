@@ -1,0 +1,136 @@
+import requests
+import pandas as pd
+from bs4 import BeautifulSoup
+import os
+import logging
+import time
+
+# For store updates (either via API or direct DB)
+# Example using HTTP API for your custom store
+STORE_API_BASE = os.getenv("STORE_API_BASE", "https://your-store.com/api")
+STORE_API_TOKEN = os.getenv("STORE_API_TOKEN", "YOUR_STORE_API_TOKEN")
+
+# LKQ settings
+LKQ_API_URL = os.getenv("LKQ_API_URL", "https://lkq-api.example.com/v1/parts")
+LKQ_USERNAME = os.getenv("LKQ_USERNAME", "user")
+LKQ_PASSWORD = os.getenv("LKQ_PASSWORD", "pass")
+
+# Cars.com settings
+CARS_SEARCH_URL = os.getenv("CARS_SEARCH_URL", "https://www.cars.com/shopping/results/?stock_type=used&page_size=20")
+
+# Markup
+MARKUP = 50
+
+# Logging
+logging.basicConfig(level=logging.INFO)
+
+def get_lkq_inventory():
+    """Pull parts inventory from LKQ via its API"""
+    resp = requests.get(LKQ_API_URL, auth=(LKQ_USERNAME, LKQ_PASSWORD))
+    if resp.status_code != 200:
+        logging.error(f"LKQ API error {resp.status_code}: {resp.text}")
+        return pd.DataFrame()
+    data = resp.json()
+    # Assume data["parts"] is a list of dicts, each having keys: id, sku, title, price, etc.
+    df = pd.DataFrame(data.get("parts", []))
+    df = df.rename(columns={
+        "id": "part_id",
+        "price": "base_price",
+        "title": "name",
+        "sku": "sku"
+    })
+    return df
+
+def get_cars_com_inventory():
+    """Scrape Cars.com to get parts/listings + price""" 
+    resp = requests.get(CARS_SEARCH_URL, headers={"User-Agent": "Mozilla/5.0"})
+    if resp.status_code != 200:
+        logging.error(f"Cars.com HTTP error {resp.status_code}")
+        return pd.DataFrame()
+    soup = BeautifulSoup(resp.text, "html.parser")
+    
+    parts = []
+    # NOTE: you’ll need to inspect the Cars.com DOM to pick correct selectors
+    # These are placeholder selectors  
+    for item in soup.select(".shop-srp-listings__listing-container"):
+        name_tag = item.select_one("h2")
+        price_tag = item.select_one(".listing-row__price")
+        sku_tag = item.select_one(".listing-row__stock-type")  # maybe not actual sku
+        
+        name = name_tag.get_text(strip=True) if name_tag else None
+        price_text = price_tag.get_text(strip=True) if price_tag else "$0"
+        # Normalize price
+        price_num = 0
+        try:
+            price_num = int(price_text.replace("$", "").replace(",", ""))
+        except ValueError:
+            logging.warning(f"Could not parse price: {price_text}")
+        
+        sku = sku_tag.get_text(strip=True) if sku_tag else None
+        
+        # If no name or price, skip
+        if not name or price_num <= 0:
+            continue
+        
+        parts.append({
+            "name": name,
+            "sku": sku,
+            "base_price": price_num
+        })
+    df = pd.DataFrame(parts)
+    return df
+
+def apply_markup(df):
+    """Add markup to base_price"""
+    df = df.copy()
+    df["price_with_markup"] = df["base_price"] + MARKUP
+    return df
+
+def update_store_inventory(df):
+    """Push updated part + price info into your store via API"""
+    # Assumes your store has an endpoint like /api/parts/<sku_or_id> or upsert
+    headers = {
+        "Authorization": f"Bearer {STORE_API_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    for _, row in df.iterrows():
+        payload = {
+            "sku": row.get("sku"),
+            "name": row.get("name"),
+            "price": row.get("price_with_markup"),
+            # other fields you want like stock qty, description, etc.
+        }
+        # Either use part_id or sku to identify the item in your store
+        # e.g. send to /api/parts/upsert
+        url = f"{STORE_API_BASE}/parts/upsert"
+        resp = requests.post(url, json=payload, headers=headers)
+        if resp.status_code in (200, 201):
+            logging.info(f"Updated/created part {row.get('sku') or row.get('name')} at price {row.get('price_with_markup')}")
+        else:
+            logging.error(f"Error updating part {row.get('sku') or row.get('name')}: {resp.status_code} {resp.text}")
+        time.sleep(0.1)  # small delay so you don’t overwhelm your API
+
+def main():
+    logging.info("Starting inventory sync")
+
+    # Get data
+    lkq_df = get_lkq_inventory()
+    cars_df = get_cars_com_inventory()
+
+    if lkq_df.empty and cars_df.empty:
+        logging.error("No data fetched from LKQ or Cars.com, stopping.")
+        return
+
+    # Combine
+    combined = pd.concat([lkq_df, cars_df], ignore_index=True, sort=False)
+
+    # Apply markup
+    combined = apply_markup(combined)
+
+    # Update store
+    update_store_inventory(combined)
+
+    logging.info("Inventory sync finished.")
+
+if __name__ == "__main__":
+    main()
