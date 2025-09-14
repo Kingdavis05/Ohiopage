@@ -1,14 +1,16 @@
-function heredoc(fn) {
-  return String(fn)
-    .replace(/^[^{]*{\s*\/\*!?/, "")
-    .replace(/\*\/\s*}\s*$/, "");
-}
 // server.js
 // Ohio Auto Parts – all-in-one (eBay-style UI + VIN modal + 1991–2026 years + cart/checkout + full results + AI image & cheapest + dropship queue)
 
 const express = require("express");
 const bodyParser = require("body-parser");
 const crypto = require("crypto");
+
+// ---- tiny helper to safely embed HTML with backticks ----
+function heredoc(fn) {
+  return String(fn)
+    .replace(/^[^{]*{\s*\/\*!?/, "")
+    .replace(/\*\/\s*}\s*$/, "");
+}
 
 // ---- ENV ----
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "sk_test_xxx";
@@ -71,16 +73,15 @@ function memoryDB() {
     async seedProducts(items){ state.products = items; },
     async listProducts(filter){
       const q = (filter.q||"").toLowerCase();
-      const all = state.products.filter(p =>
+      let all = state.products.filter(p =>
         (!filter.make  || p.make  === filter.make) &&
         (!filter.model || p.model === filter.model) &&
         (!filter.year  || p.year  === filter.year) &&
         (!filter.oemFlag || (filter.oemFlag === "oem" ? p.oem : !p.oem)) &&
         (!filter.q || (p.name.toLowerCase().includes(q) || p.part_type.toLowerCase().includes(q)))
       );
-      // price range filter
-      if (filter.min) all.splice(0, all.length, ...all.filter(p => p.price_cents >= filter.min));
-      if (filter.max) all.splice(0, all.length, ...all.filter(p => p.price_cents <= filter.max));
+      if (filter.min) all = all.filter(p => p.price_cents >= filter.min);
+      if (filter.max) all = all.filter(p => p.price_cents <= filter.max);
       return all;
     },
     async getProduct(id){ return state.products.find(p => p.id === id); },
@@ -224,7 +225,7 @@ function sampleProducts() {
     const price = (Math.floor(Math.random()*220)+35)*100;
     out.push({
       id: crypto.randomUUID(),
-      name: `${year} ${make} ${model} – ${part}`,
+      name: year + " " + make + " " + model + " – " + part,
       make, model, year, part_type: part,
       price_cents: price,
       stock: Math.floor(Math.random()*24),
@@ -251,6 +252,8 @@ async function ensureSeed() {
 
 // ---- App / Webhooks ----
 const app = express();
+
+// Stripe webhook must read the raw body:
 app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, res) => {
   let event = req.body;
   try {
@@ -258,7 +261,7 @@ app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, r
       const sig = req.headers["stripe-signature"];
       event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
     }
-  } catch (err) { return res.status(400).send(`Webhook Error: ${err.message}`); }
+  } catch (err) { return res.status(400).send("Webhook Error: " + err.message); }
 
   if (event.type === "payment_intent.succeeded") {
     const pi = event.data.object;
@@ -279,6 +282,7 @@ app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, r
   }
   res.json({ received: true });
 });
+
 app.use(bodyParser.json());
 
 app.get("/healthz", (_req, res) => res.status(200).send("ok"));
@@ -335,7 +339,7 @@ function PARTS(){
 }
 app.get("/api/makes", (_req, res) => res.json(MAKES));
 app.get("/api/models", (req, res) => res.json(MODELS[req.query.make] || []));
-app.get("/api/years", (_req, res) => res.json([...YEARS_FULL].reverse()));
+app.get("/api/years", (_req, res) => res.json([].concat(YEARS_FULL).reverse()));
 app.get("/api/parts", (_req,res)=>res.json(PARTS()));
 
 app.get("/api/products", async (req, res) => {
@@ -358,12 +362,12 @@ app.get("/api/products", async (req, res) => {
 // ---- VIN ----
 async function decodeVIN_NHTSA(vin){
   try{
-    const u = new URL(`https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVINValues/${encodeURIComponent(vin)}?format=json`);
+    const u = new URL("https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVINValues/" + encodeURIComponent(vin) + "?format=json");
     const r = await fetch(u); if(!r.ok) return null; const j = await r.json();
-    const row = j?.Results?.[0] || {};
-    const make = row?.Make || null;
-    const model = row?.Model || null;
-    const year = row?.ModelYear ? parseInt(row.ModelYear,10) : null;
+    const row = j && j.Results && j.Results[0] ? j.Results[0] : {};
+    const make = row.Make || null;
+    const model = row.Model || null;
+    const year = row.ModelYear ? parseInt(row.ModelYear,10) : null;
     return { make, model, year };
   }catch{ return null; }
 }
@@ -373,6 +377,51 @@ app.get("/api/vin/decode", async (req, res) => {
   const meta = await decodeVIN_NHTSA(vin);
   if (!meta) return res.json({ ok:false, error:"VIN decode failed." });
   res.json({ ok:true, vin, ...meta });
+});
+
+// Optional: PartsTech OEM/aftermarket matches
+async function searchPartsTech({ make, model, year, partQuery }){
+  if (!PARTSTECH_API_KEY) return null;
+  try {
+    const url = "https://api.partstech.com/catalog/search";
+    const body = { make, model, year, q: partQuery, limit: 10 };
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type":"application/json", "Authorization": "Bearer " + PARTSTECH_API_KEY },
+      body: JSON.stringify(body)
+    });
+    if (!r.ok) return null;
+    const data = await r.json();
+    return (data.items||[]).map(it => ({
+      sku: it.sku || it.partNumber || it.id,
+      brand: it.brand || it.manufacturer,
+      name: it.title || it.name,
+      oem: !!it.oem,
+      price: parseFloat(it.price || it.listPrice || 0),
+      link: it.link || it.url || null,
+      image: it.image || it.imageUrl || null
+    }));
+  } catch { return null; }
+}
+app.post("/api/vin/parts", async (req, res) => {
+  try{
+    let vin = (req.body && req.body.vin || "").toUpperCase();
+    const part = (req.body && req.body.part) || "";
+    const decoded = await decodeVIN_NHTSA(vin);
+    if (!decoded) return res.status(400).json({ error: "VIN decode failed" });
+    const make = decoded.make, model = decoded.model, year = decoded.year;
+
+    let items = await searchPartsTech({ make, model, year, partQuery: part });
+    if (!items || !items.length) {
+      const local = await (db.useMemory ? db.listProducts({ make, model, year, q: (part||"").toLowerCase() })
+                                        : dbListProducts({ make, model, year, q: (part||"").toLowerCase() }));
+      items = local.map(p => ({
+        sku: p.id, brand: p.oem ? "OEM" : "Aftermarket", name: p.name, oem: !!p.oem,
+        price: p.price_cents/100, link: null, image: p.image_url
+      }));
+    }
+    res.json({ make, model, year, items });
+  } catch(e){ res.status(400).json({ error: e.message }); }
 });
 
 // ---- AI image search & attach ----
@@ -388,7 +437,8 @@ async function fetchImageFromSerpAPI(query){
     if (!resp.ok) return null;
     const json = await resp.json();
     const imgs = json.images_results || [];
-    for (const it of imgs) {
+    for (let i=0;i<imgs.length;i++) {
+      const it = imgs[i];
       const link = it.original || it.thumbnail || it.source || it.link;
       if (link && /^https?:\/\//.test(link)) return link;
     }
@@ -408,9 +458,13 @@ async function fetchImageFromEbay(query){
     const resp = await fetch(url.toString());
     if (!resp.ok) return null;
     const json = await resp.json();
-    const arr = json.findItemsByKeywordsResponse?.[0]?.searchResult?.[0]?.item || [];
-    for (const it of arr) {
-      const img = it.galleryURL?.[0] || it.pictureURLSuperSize?.[0];
+    const arr = json.findItemsByKeywordsResponse && json.findItemsByKeywordsResponse[0] &&
+                json.findItemsByKeywordsResponse[0].searchResult &&
+                json.findItemsByKeywordsResponse[0].searchResult[0] &&
+                json.findItemsByKeywordsResponse[0].searchResult[0].item || [];
+    for (let i=0;i<arr.length;i++) {
+      const it = arr[i];
+      const img = (it.pictureURLSuperSize && it.pictureURLSuperSize[0]) || (it.galleryURL && it.galleryURL[0]);
       if (img) return img;
     }
     return null;
@@ -418,9 +472,12 @@ async function fetchImageFromEbay(query){
 }
 app.post("/api/ai/image", async (req, res) => {
   try {
-    const { product_id, make, model, year, part } = req.body || {};
+    const body = req.body || {};
+    const product_id = body.product_id;
+    const make = body.make, model = body.model, year = body.year, part = body.part;
     let p = product_id ? await dbGetProduct(product_id) : null;
-    const q = p ? `${p.year} ${p.make} ${p.model} ${p.part_type}` : [year, make, model, part].filter(Boolean).join(" ");
+    const q = p ? (p.year + " " + p.make + " " + p.model + " " + p.part_type) :
+                  [year, make, model, part].filter(Boolean).join(" ");
     let url = await fetchImageFromSerpAPI(q);
     if (!url) url = await fetchImageFromEbay(q);
     if (!url) url = "https://images.unsplash.com/photo-1517048676732-d65bc937f952?q=80&w=800&auto=format&fit=crop";
@@ -445,8 +502,9 @@ async function cheapestSerp(query){
     const json = await resp.json();
     const items = json.shopping_results || [];
     let best = null;
-    for (const it of items) {
-      const price = parseFloat((it.price||"").replace(/[^0-9.]/g,""));
+    for (let i=0;i<items.length;i++) {
+      const it = items[i];
+      const price = parseFloat(String(it.price||"").replace(/[^0-9.]/g,""));
       if (Number.isFinite(price)) { if(!best || price < best.price) best = { price, title: it.title, link: it.link, source: "Google Shopping" }; }
     }
     return best;
@@ -465,21 +523,26 @@ async function cheapestEbay(query){
     const resp = await fetch(url.toString());
     if (!resp.ok) return null;
     const json = await resp.json();
-    const arr = json.findItemsByKeywordsResponse?.[0]?.searchResult?.[0]?.item || [];
+    const arr = json.findItemsByKeywordsResponse && json.findItemsByKeywordsResponse[0] &&
+                json.findItemsByKeywordsResponse[0].searchResult &&
+                json.findItemsByKeywordsResponse[0].searchResult[0] &&
+                json.findItemsByKeywordsResponse[0].searchResult[0].item || [];
     let best=null;
-    for (const it of arr) {
-      const p = parseFloat(it.sellingStatus?.[0]?.currentPrice?.[0]?.__value__ || "NaN");
-      const title = it.title?.[0];
-      const link = it.viewItemURL?.[0];
+    for (let i=0;i<arr.length;i++) {
+      const it = arr[i];
+      const p = parseFloat(it.sellingStatus && it.sellingStatus[0] && it.sellingStatus[0].currentPrice && it.sellingStatus[0].currentPrice[0] && it.sellingStatus[0].currentPrice[0].__value__ || "NaN");
+      const title = it.title && it.title[0];
+      const link = it.viewItemURL && it.viewItemURL[0];
       if (Number.isFinite(p)) { if(!best || p < best.price) best = { price:p, title, link, source:"eBay" }; }
     }
     return best;
   }catch{ return null; }
 }
-const markup75 = price => Math.round(price * 1.75 * 100); // to cents
+function markup75(price){ return Math.round(price * 1.75 * 100); } // to cents
 app.post("/api/market/cheapest", async (req, res) => {
   try {
-    const { make, model, year, part } = req.body || {};
+    const body = req.body || {};
+    const make = body.make, model = body.model, year = body.year, part = body.part;
     const q = [year, make, model, part, "OEM OR Aftermarket"].filter(Boolean).join(" ");
     let best = await cheapestSerp(q);
     if (!best) best = await cheapestEbay(q);
@@ -487,11 +550,11 @@ app.post("/api/market/cheapest", async (req, res) => {
       const base = /rotor|radiator|bumper|compressor|converter/i.test(part||"") ? 180
                 : /alternator|shock|control|bearing|headlight/i.test(part||"") ? 120
                 : /filter|plug|sensor/i.test(part||"") ? 28 : 75;
-      best = { price: base, title: `${year||""} ${make||""} ${model||""} ${part||""}`.trim(), link: null, source: "Heuristic" };
+      best = { price: base, title: (String(year||"")+" "+String(make||"")+" "+String(model||"")+" "+String(part||"")).trim(), link: null, source: "Heuristic" };
     }
     const product = {
       id: "ai-"+crypto.randomUUID(),
-      name: `${year||""} ${make||""} ${model||""} – ${part||""} (AI-sourced)`.replace(/\s+/g," ").trim(),
+      name: (String(year||"")+" "+String(make||"")+" "+String(model||"")+" – "+String(part||"")+" (AI-sourced)").replace(/\s+/g," ").trim(),
       make, model, year: year?parseInt(year,10):undefined,
       part_type: part, price_cents: markup75(best.price), stock: 5,
       image_url: null, source_price: best.price, source_link: best.link, source_from: best.source
@@ -521,11 +584,11 @@ async function easypostRates({ to, parcel }){
     headers: { "Content-Type":"application/json", "Authorization": "Basic " + Buffer.from(EASYPOST_API_KEY + ":").toString("base64") },
     body: JSON.stringify(payload)
   });
-  if (!resp.ok) throw new Error(`EasyPost ${resp.status} ${await resp.text()}`);
+  if (!resp.ok) throw new Error("EasyPost " + resp.status + " " + (await resp.text()));
   const json = await resp.json();
   return (json.rates||[])
     .filter(r => ["UPS","FedEx","DHLExpress","USPS","DHL eCommerce"].includes(r.carrier))
-    .map(r => ({ carrier: r.carrier.replace("DHLExpress","DHL"), service: r.service, days: r.delivery_days||null, amount_cents: Math.round(parseFloat(r.rate)*100) }))
+    .map(r => ({ carrier: String(r.carrier).replace("DHLExpress","DHL"), service: r.service, days: r.delivery_days||null, amount_cents: Math.round(parseFloat(r.rate)*100) }))
     .sort((a,b)=>a.amount_cents-b.amount_cents)
     .slice(0,6);
 }
@@ -555,7 +618,10 @@ function heuristicRates({ domestic, billable, zoneMult, residentialFee, remoteFe
 }
 app.post("/api/shipping/rates", async (req, res) => {
   try {
-    const { address = {}, cart = [], subtotal_cents = 0 } = req.body || {};
+    const body = req.body || {};
+    const address = body.address || {};
+    const cart = body.cart || [];
+    const subtotal_cents = body.subtotal_cents || 0;
     const to = {
       name: address.name||"", email: address.email||"",
       line1: address.line1||"", line2: address.line2||"", city: address.city||"", state: address.state||"",
@@ -563,7 +629,8 @@ app.post("/api/shipping/rates", async (req, res) => {
     };
     // Aggregate to one parcel
     let totalWeightLb = 0, dimL=0, dimW=0, dimH=0;
-    for (const item of cart) {
+    for (let i=0;i<cart.length;i++) {
+      const item = cart[i];
       const p = await dbGetProduct(item.id); if (!p) continue;
       const qty = Math.max(1, parseInt(item.qty||1,10));
       totalWeightLb += (p.weight_lb||2)*qty;
@@ -593,9 +660,15 @@ app.post("/api/shipping/rates", async (req, res) => {
 // ---- Payments + dropship ----
 app.post("/create-payment-intent", async (req, res) => {
   try {
-    const { cart = [], currency = "usd", email, shipping = null } = req.body || {};
+    const body = req.body || {};
+    const cart = body.cart || [];
+    const currency = body.currency || "usd";
+    const email = body.email;
+    const shipping = body.shipping || null;
+
     let subtotal = 0; const compactItems = [];
-    for (const item of cart) {
+    for (let i=0;i<cart.length;i++) {
+      const item = cart[i];
       const p = String(item.id).startsWith("ai-") ? null : await dbGetProduct(item.id);
       const qty = Math.max(1, parseInt(item.qty||1,10));
       const unit = p ? p.price_cents : parseInt(item.price_cents, 10);
@@ -604,7 +677,7 @@ app.post("/create-payment-intent", async (req, res) => {
       compactItems.push({ id:item.id, name:item.name, qty, unit_price_cents: unit });
     }
     if (subtotal <= 0) subtotal = 4900;
-    const shipping_cents = shipping?.amount_cents ? parseInt(shipping.amount_cents,10) : 0;
+    const shipping_cents = shipping && shipping.amount_cents ? parseInt(shipping.amount_cents,10) : 0;
     const amount = subtotal + Math.max(0, shipping_cents);
 
     const paymentIntent = await stripe.paymentIntents.create({
@@ -620,7 +693,7 @@ async function queueDropship(order){
   try {
     if (DROPSHIP_WEBHOOK_URL) {
       const r = await fetch(DROPSHIP_WEBHOOK_URL, { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({ event:"order.paid", order }) });
-      if (!r.ok) throw new Error(`Dropship webhook ${r.status}`);
+      if (!r.ok) throw new Error("Dropship webhook " + r.status);
       console.log("[dropship] forwarded to webhook");
     } else {
       console.log("[dropship] webhook not set; order queued in logs only");
@@ -630,9 +703,10 @@ async function queueDropship(order){
   }
 }
 
-// ---- Frontend (eBay-style) ----
+// ---- Frontend (eBay-style) via heredoc (safe with backticks inside) ----
 app.get("/", (_req, res) => {
-  res.type("html").send(`<!doctype html>
+  const html = heredoc(function () {/*!
+<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Ohio Auto Parts</title>
@@ -696,35 +770,29 @@ select,input{width:100%;padding:10px;border-radius:10px;border:1px solid var(--l
 </header>
 
 <div class="wrap">
-  <!-- Filters -->
   <aside class="panel">
     <div class="hdr">Filters</div>
     <label>Make</label><select id="makeSel"><option value="">Any</option></select>
     <label>Model</label><select id="modelSel" disabled><option value="">Any</option></select>
     <label>Year (1991–2026)</label><select id="yearSel"><option value="">Any</option></select>
-
     <label>Type</label>
     <div class="filter-row">
       <label style="display:flex;gap:8px;align-items:center"><input type="radio" name="oem" value="" checked style="width:auto"> All</label>
       <label style="display:flex;gap:8px;align-items:center"><input type="radio" name="oem" value="oem" style="width:auto"> OEM</label>
       <label style="display:flex;gap:8px;align-items:center"><input type="radio" name="oem" value="aftermarket" style="width:auto"> Aftermarket</label>
     </div>
-
     <label>Price</label>
     <div class="filter-row">
       <input id="minPrice" type="number" placeholder="Min $"/>
       <input id="maxPrice" type="number" placeholder="Max $"/>
     </div>
-
     <label>Popular Parts</label>
     <div id="partsCloud" class="filter-row" style="grid-template-columns:1fr 1fr"></div>
-
     <button id="applyFilters" style="margin-top:10px;padding:10px;border:none;border-radius:10px;background:linear-gradient(135deg,var(--accent),var(--gold));color:#111;font-weight:800;cursor:pointer;width:100%">Apply</button>
     <div class="line"></div>
     <div class="helper">Tip: Use the VIN tool to auto-fill Make/Model/Year.</div>
   </aside>
 
-  <!-- Results -->
   <section class="results">
     <div class="result-head">
       <div id="resultCount" class="helper">0 results</div>
@@ -734,14 +802,12 @@ select,input{width:100%;padding:10px;border-radius:10px;border:1px solid var(--l
     <button id="loadMore" class="loadmore">Load more</button>
   </section>
 
-  <!-- Cart & Checkout -->
   <aside class="panel side">
     <div class="hdr">Cart</div>
     <div id="cart" class="cart"></div>
     <div class="line"></div>
     <div class="helper">Subtotal: <b id="subtotal">$0.00</b></div>
     <div class="line"></div>
-
     <div class="hdr">Shipping</div>
     <input id="name" placeholder="Full name"/>
     <input id="email" placeholder="Email" style="margin-top:6px"/>
@@ -755,7 +821,6 @@ select,input{width:100%;padding:10px;border-radius:10px;border:1px solid var(--l
     <div class="helper">Shipping: <b id="shiptotal">$0.00</b></div>
     <div class="helper">Order Total: <b id="grandtotal">$0.00</b></div>
     <div class="line"></div>
-
     <div id="payment-request-button" style="margin:6px 0"></div>
     <div id="payment-element"></div>
     <button id="pay" style="margin-top:10px;padding:12px;border:none;border-radius:10px;background:linear-gradient(135deg,var(--accent),var(--gold));color:#111;font-weight:900;cursor:pointer;width:100%">Pay Now</button>
@@ -763,7 +828,6 @@ select,input{width:100%;padding:10px;border-radius:10px;border:1px solid var(--l
   </aside>
 </div>
 
-<!-- VIN Modal -->
 <div id="vinModal" class="modal">
   <div class="sheet">
     <button class="closex" id="closeVin">Close</button>
@@ -789,7 +853,6 @@ const listEl=document.getElementById('list');
 const resultCount=document.getElementById('resultCount');
 
 async function init(){
-  // load filters
   const makes = await (await fetch('/api/makes')).json();
   makeSel.innerHTML = '<option value="">Any</option>'+makes.map(m=>'<option>'+m+'</option>').join('');
   makeSel.onchange = async ()=>{
@@ -799,25 +862,21 @@ async function init(){
   };
   const years = await (await fetch('/api/years')).json();
   yearSel.innerHTML = '<option value="">Any</option>'+years.map(y=>'<option>'+y+'</option>').join('');
-  // parts cloud
   const parts = await (await fetch('/api/parts')).json();
-  partsCloud.innerHTML = parts.slice(0,12).map(p=>\`<button class="btnPart" style="padding:8px;border:1px solid var(--line);border-radius:999px;background:#0f0f0f;color:#eee;cursor:pointer">\${p}</button>\`).join('');
+  partsCloud.innerHTML = parts.slice(0,12).map(p=>'<button class="btnPart" style="padding:8px;border:1px solid var(--line);border-radius:999px;background:#0f0f0f;color:#eee;cursor:pointer">'+p+'</button>').join('');
   partsCloud.querySelectorAll('.btnPart').forEach(b=>b.onclick=()=>{ document.getElementById('searchBox').value=b.textContent; doSearch(true); });
 
   document.getElementById('goSearch').onclick=()=>doSearch(true);
   document.getElementById('applyFilters').onclick=()=>doSearch(true);
   document.getElementById('loadMore').onclick=()=>doSearch(false);
 
-  // VIN modal
   const vinModal = document.getElementById('vinModal');
   document.getElementById('vinBtn').onclick=()=>{ vinModal.style.display='flex'; document.getElementById('vinInput').focus(); };
   document.getElementById('closeVin').onclick=()=>{ vinModal.style.display='none'; };
   document.getElementById('vinGo').onclick=decodeVIN;
 
-  // seed demo data
   document.getElementById('seedBtn').onclick=async ()=>{ await fetch('/admin/seed',{method:'POST',headers:{Authorization:'Bearer '+encodeURIComponent('changeme-admin')}}); doSearch(true); };
 
-  // cart & stripe
   renderCart(); await initStripe();
   doSearch(true);
 }
@@ -827,11 +886,11 @@ async function decodeVIN(){
   if (!vin || vin.length!==17){ vinMeta.textContent='VIN must be 17 chars.'; return; }
   const r = await fetch('/api/vin/decode?vin='+encodeURIComponent(vin)); const d = await r.json();
   if (!d.ok){ vinMeta.textContent = d.error || 'Decode failed.'; return; }
-  vinMeta.textContent = \`Detected: \${d.year||'—'} \${d.make||''} \${d.model||''}\`;
+  vinMeta.textContent = 'Detected: ' + (d.year||'—') + ' ' + (d.make||'') + ' ' + (d.model||'');
   if (d.make){ makeSel.value = d.make; const models = await (await fetch('/api/models?make='+encodeURIComponent(d.make))).json(); modelSel.disabled=false; modelSel.innerHTML='<option value="">Any</option>'+models.map(x=>'<option>'+x+'</option>').join(''); }
   if (d.model){ modelSel.value = d.model; }
   if (d.year){ yearSel.value = d.year; }
-  document.getElementById('vinModal').style.display='none'; // pop it into the filters
+  document.getElementById('vinModal').style.display='none';
   doSearch(true);
 }
 function selectedOem(){ const el=document.querySelector('input[name="oem"]:checked'); return el?el.value:""; }
@@ -849,7 +908,7 @@ async function doSearch(reset){
   const max = parseInt(document.getElementById('maxPrice').value||''); if(max) params.set('max_price', max*100);
   params.set('page', page); params.set('page_size', pageSize);
   const res = await fetch('/api/products?'+params.toString()); const js = await res.json();
-  total = js.total; resultCount.textContent = \`\${total} results\`;
+  total = js.total; resultCount.textContent = total + ' results';
   renderItems(js.items);
   const more = page * pageSize < total; document.getElementById('loadMore').style.display = more ? 'block' : 'none';
   if (more) page += 1;
@@ -857,24 +916,25 @@ async function doSearch(reset){
 function renderItems(items){
   if (!items.length && !listEl.children.length){ listEl.innerHTML='<div class="helper" style="padding:12px">No items found.</div>'; return; }
   const frag = document.createDocumentFragment();
-  for (const p of items){
+  for (let i=0;i<items.length;i++){
+    const p = items[i];
     const el = document.createElement('div'); el.className='item';
-    el.innerHTML = \`
-      <img class="thumb" src="\${p.image_url || ''}" alt="">
-      <div>
-        <div class="title">\${p.name} \${p.stock>0?'<span class="badge">In stock</span>':'<span class="badge" style="opacity:.6">Backorder</span>'}</div>
-        <div class="meta">\${p.part_type} • \${p.oem?'OEM':'Aftermarket'}</div>
-        <div class="meta">Make/Model/Year: \${p.make} / \${p.model} / \${p.year}</div>
-        \${p.image_url ? '' : '<button class="btnFind" style="padding:8px;border:1px solid var(--line);border-radius:8px;background:#0f0f0f;color:#fff;cursor:pointer;margin-top:6px">Find Photo (AI)</button>'}
-      </div>
-      <div>
-        <div class="price">\${fmt(p.price_cents)}</div>
-        <button class="btnAdd" \${p.stock>0?'':'disabled'} style="margin-top:6px">\${p.stock>0?'Add to cart':'Out of stock'}</button>
-      </div>\`;
+    el.innerHTML = ''
+      + '<img class="thumb" src="'+(p.image_url || '')+'" alt="">'
+      + '<div>'
+      +   '<div class="title">'+p.name+' '+(p.stock>0?'<span class="badge">In stock</span>':'<span class="badge" style="opacity:.6">Backorder</span>')+'</div>'
+      +   '<div class="meta">'+p.part_type+' • '+(p.oem?'OEM':'Aftermarket')+'</div>'
+      +   '<div class="meta">Make/Model/Year: '+p.make+' / '+p.model+' / '+p.year+'</div>'
+      +   (p.image_url ? '' : '<button class="btnFind" style="padding:8px;border:1px solid var(--line);border-radius:8px;background:#0f0f0f;color:#fff;cursor:pointer;margin-top:6px">Find Photo (AI)</button>')
+      + '</div>'
+      + '<div>'
+      +   '<div class="price">'+fmt(p.price_cents)+'</div>'
+      +   '<button class="btnAdd" '+(p.stock>0?'':'disabled')+' style="margin-top:6px">'+(p.stock>0?'Add to cart':'Out of stock')+'</button>'
+      + '</div>';
     const btn = el.querySelector('.btnAdd');
-    btn && (btn.onclick = ()=> addToCart(p.id, p.name, p.price_cents));
+    if (btn) btn.onclick = function(){ addToCart(p.id, p.name, p.price_cents); };
     const findBtn = el.querySelector('.btnFind');
-    if (findBtn) findBtn.onclick = async ()=>{
+    if (findBtn) findBtn.onclick = async function(){
       findBtn.textContent='Searching…'; findBtn.disabled=true;
       const AiRes = await fetch('/api/ai/image',{ method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ product_id: p.id }) });
       const data = await AiRes.json();
@@ -895,20 +955,21 @@ function addToCart(id,name,price_cents){
 function renderCart(){
   const box=document.getElementById('cart'); box.innerHTML='';
   if(!cart.length){ box.innerHTML='<div class="helper">Your cart is empty.</div>'; }
-  cart.forEach(item=>{
+  for (let i=0;i<cart.length;i++){
+    const item = cart[i];
     const row=document.createElement('div'); row.className='cart-item';
-    row.innerHTML=\`
-      <div>\${item.name}</div>
-      <div style="display:flex;gap:6px;align-items:center">
-        <button class="q-" style="padding:6px;border:1px solid var(--line);background:#0f0f0f;color:#fff;border-radius:6px;cursor:pointer">-</button>
-        <b>\${item.qty}</b>
-        <button class="q+" style="padding:6px;border:1px solid var(--line);background:#0f0f0f;color:#fff;border-radius:6px;cursor:pointer">+</button>
-      </div>
-      <div>\${fmt(item.price_cents*item.qty)}</div>\`;
-    row.querySelector('.q-').onclick=()=>{ item.qty=Math.max(0,item.qty-1); if(!item.qty) cart.splice(cart.indexOf(item),1); renderCart(); };
-    row.querySelector('.q+').onclick=()=>{ item.qty+=1; renderCart(); };
+    row.innerHTML=''
+      + '<div>'+item.name+'</div>'
+      + '<div style="display:flex;gap:6px;align-items:center">'
+      +   '<button class="q-" style="padding:6px;border:1px solid var(--line);background:#0f0f0f;color:#fff;border-radius:6px;cursor:pointer">-</button>'
+      +   '<b>'+item.qty+'</b>'
+      +   '<button class="q+" style="padding:6px;border:1px solid var(--line);background:#0f0f0f;color:#fff;border-radius:6px;cursor:pointer">+</button>'
+      + '</div>'
+      + '<div>'+fmt(item.price_cents*item.qty)+'</div>';
+    row.querySelector('.q-').onclick=function(){ item.qty=Math.max(0,item.qty-1); if(!item.qty) cart.splice(cart.indexOf(item),1); renderCart(); };
+    row.querySelector('.q+').onclick=function(){ item.qty+=1; renderCart(); };
     box.appendChild(row);
-  });
+  }
   subtotalCents = cart.reduce((s,i)=>s+i.price_cents*i.qty,0);
   document.getElementById('subtotal').textContent = fmt(subtotalCents);
   updateTotals();
@@ -917,12 +978,12 @@ function renderCart(){
 }
 
 function updateTotals(){
-  const ship = selectedRate?.amount_cents || 0;
+  const ship = selectedRate && selectedRate.amount_cents || 0;
   document.getElementById('grandtotal').textContent = fmt(subtotalCents + ship);
 }
 
 // Shipping
-document.getElementById('getRates').onclick = async ()=>{
+document.getElementById('getRates').onclick = async function(){
   if(!cart.length){ alert('Add items to cart first.'); return; }
   const address = {
     name: document.getElementById('name').value,
@@ -936,46 +997,52 @@ document.getElementById('getRates').onclick = async ()=>{
     residential: document.getElementById('residential').checked
   };
   const r = await fetch('/api/shipping/rates',{ method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ address, cart, subtotal_cents: subtotalCents }) });
-  const { quotes } = await r.json();
+  const js = await r.json();
+  const quotes = js.quotes || [];
   const list = document.getElementById('rates');
-  if(!quotes || !quotes.length){ list.innerHTML='<div class="helper">No shipping options found.</div>'; return; }
-  list.innerHTML = quotes.map((q,i)=>\`
-    <label class="rate">
-      <input type="radio" name="rate" value="\${i}">
-      <div style="flex:1">\${q.carrier} – \${q.service} \${q.days?'<span class="helper">(~'+q.days+'d)</span>':''}</div>
-      <div style="font-weight:800;color:#ffd76b">\${fmt(q.amount_cents)}</div>
-    </label>\`).join('');
-  list.querySelectorAll('input[name="rate"]').forEach((rb,i)=>{
-    rb.addEventListener('change', ()=>{
-      selectedRate = quotes[i];
-      document.getElementById('shiptotal').textContent = fmt(selectedRate.amount_cents);
-      updateTotals(); updateStripe(subtotalCents, selectedRate.amount_cents);
-    });
-  });
+  if(!quotes.length){ list.innerHTML='<div class="helper">No shipping options found.</div>'; return; }
+  list.innerHTML = quotes.map(function(q,i){
+    return '<label class="rate">'
+      + '<input type="radio" name="rate" value="'+i+'">'
+      + '<div style="flex:1">'+q.carrier+' – '+q.service+' '+(q.days?'<span class="helper">(~'+q.days+'d)</span>':'')+'</div>'
+      + '<div style="font-weight:800;color:#ffd76b">'+fmt(q.amount_cents)+'</div>'
+      + '</label>';
+  }).join('');
+  var rbs = list.querySelectorAll('input[name="rate"]');
+  for (var i=0;i<rbs.length;i++){
+    (function(idx){
+      rbs[idx].addEventListener('change', function(){
+        selectedRate = quotes[idx];
+        document.getElementById('shiptotal').textContent = fmt(selectedRate.amount_cents);
+        updateTotals(); updateStripe(subtotalCents, selectedRate.amount_cents);
+      });
+    })(i);
+  }
 };
 
 // Stripe
-const messageEl=document.getElementById('message'); const setMsg=(m)=>messageEl.textContent=m||'';
+const messageEl=document.getElementById('message'); function setMsg(m){ messageEl.textContent=m||''; }
 async function initStripe(){
-  const { publishableKey } = await (await fetch('/config')).json();
-  stripe = Stripe(publishableKey);
+  const js = await (await fetch('/config')).json();
+  stripe = Stripe(js.publishableKey);
   await updateStripe(0,0);
 }
 async function createPI(subtotal, shipping){
   const email = document.getElementById('email').value || undefined;
   const shippingMeta = selectedRate ? { carrier:selectedRate.carrier, service:selectedRate.service, days:selectedRate.days, amount_cents:selectedRate.amount_cents } : null;
-  const payloadCart = cart.map(i=>({ id:i.id, name:i.name, qty:i.qty, price_cents:i.price_cents }));
+  const payloadCart = cart.map(function(i){ return { id:i.id, name:i.name, qty:i.qty, price_cents:i.price_cents }; });
   const res = await fetch('/create-payment-intent',{
     method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ currency:'usd', cart: payloadCart, email, shipping: shippingMeta })
+    body: JSON.stringify({ currency:'usd', cart: payloadCart, email: email, shipping: shippingMeta })
   });
   const js = await res.json(); if(js.error) throw new Error(js.error); return js;
 }
 async function updateStripe(subtotal, shipping){
   setMsg('');
-  const { clientSecret: cs, amount } = await createPI(subtotal, shipping);
+  const js = await createPI(subtotal, shipping);
+  const cs = js.clientSecret, amount = js.amount;
   clientSecret = cs;
-  elements = stripe.elements({ clientSecret });
+  elements = stripe.elements({ clientSecret: cs });
 
   if (paymentElement) paymentElement.unmount();
   paymentElement = elements.create('payment'); paymentElement.mount('#payment-element');
@@ -983,34 +1050,36 @@ async function updateStripe(subtotal, shipping){
   if (!paymentRequest) {
     paymentRequest = stripe.paymentRequest({
       country:'US', currency:'usd',
-      total: { label:'Ohio Auto Parts', amount: amount|| (subtotal + (shipping||0)) },
+      total: { label:'Ohio Auto Parts', amount: amount || (subtotal + (shipping||0)) },
       requestPayerName:true, requestPayerEmail:true
     });
-    prButton = elements.create('paymentRequestButton', { paymentRequest });
+    prButton = elements.create('paymentRequestButton', { paymentRequest: paymentRequest });
     const can = await paymentRequest.canMakePayment();
     if (can) prButton.mount('#payment-request-button'); else document.getElementById('payment-request-button').style.display='none';
-    paymentRequest.on('paymentmethod', async (ev)=>{
-      const { error } = await stripe.confirmCardPayment(clientSecret, { payment_method: ev.paymentMethod.id }, { handleActions: true });
-      if (error) { ev.complete('fail'); setMsg(error.message||'Payment failed.'); return; }
+    paymentRequest.on('paymentmethod', async function(ev){
+      const r = await stripe.confirmCardPayment(clientSecret, { payment_method: ev.paymentMethod.id }, { handleActions: true });
+      if (r.error) { ev.complete('fail'); setMsg(r.error.message||'Payment failed.'); return; }
       ev.complete('success'); setMsg('Payment successful!');
     });
   } else {
-    paymentRequest.update({ total: { label:'Ohio Auto Parts', amount: amount|| (subtotal + (shipping||0)) } });
+    paymentRequest.update({ total: { label:'Ohio Auto Parts', amount: amount || (subtotal + (shipping||0)) } });
   }
-  document.getElementById('grandtotal').textContent = fmt(amount|| (subtotal + (shipping||0)));
+
+  document.getElementById('grandtotal').textContent = fmt(amount || (subtotal + (shipping||0)));
 }
-document.getElementById('pay').onclick = async ()=>{
+document.getElementById('pay').onclick = async function(){
   try{
     setMsg('Processing…');
-    const { error } = await stripe.confirmPayment({ elements, confirmParams:{ return_url: window.location.href }, redirect: 'if_required' });
-    if (error) setMsg(error.message||'Payment failed.'); else setMsg('Payment successful!');
+    const r = await stripe.confirmPayment({ elements: elements, confirmParams:{ return_url: window.location.href }, redirect: 'if_required' });
+    if (r.error) setMsg(r.error.message||'Payment failed.'); else setMsg('Payment successful!');
   }catch(e){ setMsg(e.message); }
 };
 
 init();
 </script>
 </body></html>
-`);
+*/});
+  res.type("html").send(html);
 });
 
 // Admin seed endpoint
@@ -1023,4 +1092,6 @@ app.post("/admin/seed", async (req, res) => {
 // ---- Listen ----
 const HOST = "0.0.0.0";
 const PORT = Number(process.env.PORT) || 3000;
-app.listen(PORT, HOST, () => console.log(\`Ohio Auto Parts listening on http://\${HOST}:\${PORT}\`));
+app.listen(PORT, HOST, function(){
+  console.log("Ohio Auto Parts listening on http://" + HOST + ":" + PORT);
+});
