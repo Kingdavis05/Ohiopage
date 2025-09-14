@@ -1,79 +1,58 @@
-const express = require('express');
-const bodyParser = require('body-parser');
-const fs = require('fs');
-const path = require('path');
-const cors = require('cors');
-require('dotenv').config();
+// server.js
+const express = require("express");
+const path = require("path");
+const fs = require("fs");
 
 const app = express();
-const DB_FILE = path.join(__dirname, 'db.json');
 const PORT = process.env.PORT || 3000;
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'changeme';
 
-app.use(cors());
-app.use(bodyParser.json());
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.json());
 
-function readDB() {
-  return JSON.parse(fs.readFileSync(DB_FILE));
-}
-function writeDB(data) {
-  fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
-}
+// Serve static files from /public
+app.use(express.static(path.join(__dirname, "public")));
 
-app.get('/api/products', (req, res) => {
-  const db = readDB();
-  res.json(db.products);
+// --- Simple Products API with images ---
+// If db.json exists and has products, we'll use it.
+// Otherwise we return a nice default catalog WITH images.
+app.get("/api/products", (req, res) => {
+  try {
+    const dbPath = path.join(__dirname, "db.json");
+    if (fs.existsSync(dbPath)) {
+      const db = JSON.parse(fs.readFileSync(dbPath, "utf8"));
+      if (Array.isArray(db?.products) && db.products.length) {
+        return res.json(db.products);
+      }
+    }
+  } catch (e) {
+    console.warn("db.json read failed:", e.message);
+  }
+
+  // Default catalog (swap image URLs later if you want)
+  return res.json([
+    { id: "brake-pads-front", name: "Brake Pads – Front",    image: "https://picsum.photos/seed/brake-pads/800/480",  base_price: 79.99,  year: 2020, make: "Toyota", model: "Camry" },
+    { id: "alternator",       name: "Alternator",            image: "https://picsum.photos/seed/alternator/800/480",  base_price: 199.99, year: 2019, make: "Honda",  model: "Civic" },
+    { id: "radiator",         name: "Radiator",              image: "https://picsum.photos/seed/radiator/800/480",    base_price: 149.99, year: 2021, make: "Ford",   model: "F-150" },
+    { id: "air-filter",       name: "Engine Air Filter",     image: "https://picsum.photos/seed/air-filter/800/480",  base_price: 18.99,  year: 2018, make: "Nissan", model: "Altima" },
+    { id: "oil-filter",       name: "Oil Filter",            image: "https://picsum.photos/seed/oil-filter/800/480",  base_price: 9.49,   year: 2017, make: "Chevy",  model: "Malibu" },
+    { id: "spark-plugs",      name: "Spark Plugs (4-pack)",  image: "https://picsum.photos/seed/spark-plugs/800/480", base_price: 24.99,  year: 2016, make: "Hyundai",model: "Elantra" },
+    { id: "wiper-blades",     name: "Wiper Blades (pair)",   image: "https://picsum.photos/seed/wiper/800/480",       base_price: 14.99,  year: 2022, make: "Kia",    model: "Sorento" },
+    { id: "brake-rotor",      name: "Brake Rotor (Front)",   image: "https://picsum.photos/seed/rotor/800/480",       base_price: 59.99,  year: 2015, make: "BMW",    model: "328i" },
+    { id: "headlight",        name: "Headlight Assembly",    image: "https://picsum.photos/seed/headlight/800/480",   base_price: 129.00, year: 2014, make: "Audi",   model: "A4" },
+    { id: "car-battery",      name: "12V Car Battery",       image: "https://picsum.photos/seed/battery/800/480",     base_price: 139.00, year: 2023, make: "Tesla",  model: "Model 3" },
+    { id: "starter",          name: "Starter Motor",         image: "https://picsum.photos/seed/starter/800/480",     base_price: 179.00, year: 2012, make: "Jeep",   model: "Wrangler" },
+    { id: "fuel-pump",        name: "Fuel Pump",             image: "https://picsum.photos/seed/fuel-pump/800/480",   base_price: 169.00, year: 2013, make: "VW",     model: "Jetta" }
+  ]);
 });
 
-app.post('/api/orders', (req, res) => {
-  const db = readDB();
-  const order = {
-    id: Date.now().toString(),
-    items: req.body.items || [],
-    customer: req.body.customer || {},
-    status: 'pending',
-    createdAt: new Date().toISOString()
-  };
-  db.orders.push(order);
-  writeDB(db);
-  // Trigger simple automation processor (append to queue file)
-  const queueFile = path.join(__dirname, 'automation_queue.json');
-  let queue = [];
-  if (fs.existsSync(queueFile)) queue = JSON.parse(fs.readFileSync(queueFile));
-  queue.push(order);
-  fs.writeFileSync(queueFile, JSON.stringify(queue, null, 2));
-  res.json({ success: true, orderId: order.id });
+// (Optional) Demo orders endpoint
+app.post("/api/orders", (req, res) => {
+  // In production, validate + store order, then charge via Stripe/PayPal.
+  res.status(201).json({ ok: true });
 });
 
-// Admin listing of orders (simple password)
-app.get('/admin/orders', (req, res) => {
-  const pwd = req.query.pwd;
-  if (pwd !== ADMIN_PASSWORD) return res.status(403).json({ error: 'forbidden' });
-  const db = readDB();
-  res.json(db.orders);
+// Always send index.html (so #/cart and #/checkout work)
+app.get("*", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
-// Simple endpoint to trigger processing (render cron or manual)
-app.post('/admin/process', (req, res) => {
-  const pwd = req.query.pwd;
-  if (pwd !== ADMIN_PASSWORD) return res.status(403).json({ error: 'forbidden' });
-  // move queue to processing and call orderProcessor
-  const queueFile = path.join(__dirname, 'automation_queue.json');
-  if (!fs.existsSync(queueFile)) return res.json({ processed: 0 });
-  const queue = JSON.parse(fs.readFileSync(queueFile));
-  // append to automation log and clear queue
-  const logFile = path.join(__dirname, 'automation.log');
-  fs.appendFileSync(logFile, JSON.stringify(queue, null, 2) + "\n");
-  fs.unlinkSync(queueFile);
-  res.json({ processed: queue.length });
-});
-
-// Fallback — serve index.html
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
-app.listen(PORT, () => {
-  console.log('Server listening on port', PORT);
-});
+app.listen(PORT, () => console.log(`✅ Server running on ${PORT}`));
