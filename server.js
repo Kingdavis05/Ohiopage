@@ -1,5 +1,6 @@
 // server.js
-// Ohio Auto Parts – all-in-one (eBay-style UI + VIN modal + 1991–2026 years + cart/checkout + full results + AI image & cheapest + dropship queue)
+// Ohio Auto Parts – all-in-one (eBay-style UI + VIN modal + 1991–2026 years + cart/checkout + full results
+// + AI image & cheapest + dropship queue + ENHANCED SEARCH (auto-image + AI fallback))
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -27,9 +28,9 @@ const SHIP_FROM_COUNTRY = process.env.SHIP_FROM_COUNTRY || "US";
 const SHIP_FROM_PHONE = process.env.SHIP_FROM_PHONE || "5555555555";
 const SHIP_FROM_EMAIL = process.env.SHIP_FROM_EMAIL || "support@example.com";
 
-// Optional adapters
+// Optional adapters (set the keys in Render for real data)
 const PARTSTECH_API_KEY = process.env.PARTSTECH_API_KEY || ""; // OEM/aftermarket catalog
-const SERPAPI_KEY = process.env.SERPAPI_KEY || ""; // google_shopping / google_images
+const SERPAPI_KEY = process.env.SERPAPI_KEY || ""; // Google Shopping/Images via SerpAPI
 const EBAY_APP_ID  = process.env.EBAY_APP_ID  || ""; // eBay Finding API
 
 // Dropship processing: post orders to your fulfillment webhook
@@ -47,96 +48,6 @@ const stripe = require("stripe")(STRIPE_SECRET_KEY);
 // ---- DB (memory with optional Postgres) ----
 let db = { useMemory: true };
 let pgPool = null;
-
-// === ENHANCED SEARCH: auto-image + AI-sourced fallback ===
-function fallbackImage() {
-  return "https://images.unsplash.com/photo-1517048676732-d65bc937f952?q=80&w=800&auto=format&fit=crop";
-}
-
-async function ensureImageForProduct(p) {
-  try {
-    if (p.image_url) return p.image_url;
-    const q = [p.year, p.make, p.model, p.part_type].filter(Boolean).join(" ");
-    let url = await fetchImageFromSerpAPI(q);
-    if (!url) url = await fetchImageFromEbay(q);
-    if (!url) url = fallbackImage();
-    // persist to DB/memory
-    await dbUpdateProductImage(p.id, url);
-    p.image_url = url;
-    return url;
-  } catch {
-    p.image_url = p.image_url || fallbackImage();
-    return p.image_url;
-  }
-}
-
-app.get("/api/search/enhanced", async (req, res) => {
-  try {
-    const { make, model, year, q, oem, min_price, max_price, page, page_size } = req.query;
-    const filter = {
-      make, model,
-      year: year ? parseInt(year,10) : undefined,
-      q: (q||"").toLowerCase(),
-      oemFlag: oem,
-      min: min_price ? parseInt(min_price,10) : undefined,
-      max: max_price ? parseInt(max_price,10) : undefined
-    };
-
-    // Get full list for total count
-    const list = await (db.useMemory ? db.listProducts(filter) : dbListProducts(filter));
-    const total = list.length;
-
-    // Paginate first
-    const ps = Math.min(parseInt(page_size||"60",10), 200);
-    const pg = Math.max(1, parseInt(page||"1",10));
-    const start = (pg-1)*ps, end = start + ps;
-    let items = list.slice(start, end);
-
-    // Auto-attach images to the first few that need them (keeps response fast)
-    const NEEDS = items.filter(p => !p.image_url).slice(0, 12);
-    for (const p of NEEDS) { await ensureImageForProduct(p); }
-
-    // If nothing found, AI-source a part + image and return it as "available"
-    if (total === 0) {
-      // Build a sensible query from inputs
-      const partHint = (q||"").trim() || "auto part";
-      const queryForMarket = [year, make, model, partHint, "OEM OR Aftermarket"].filter(Boolean).join(" ");
-      let best = await cheapestSerp(queryForMarket);
-      if (!best) best = await cheapestEbay(queryForMarket);
-
-      let sourcePrice = best && best.price ? best.price : (
-        /rotor|radiator|bumper|compressor|converter/i.test(partHint) ? 180 :
-        /alternator|shock|control|bearing|headlight/i.test(partHint) ? 120 :
-        /filter|plug|sensor/i.test(partHint) ? 28 : 75
-      );
-
-      const aiProduct = {
-        id: "ai-" + crypto.randomUUID(),
-        name: `${year||""} ${make||""} ${model||""} – ${partHint} (AI-sourced)`.replace(/\s+/g," ").trim(),
-        make, model, year: year?parseInt(year,10):undefined,
-        part_type: partHint,
-        price_cents: Math.round(sourcePrice * 1.75 * 100),
-        stock: 5, // show as available
-        oem: false,
-        image_url: null,
-        source_price: sourcePrice,
-        source_link: best ? best.link : null,
-        source_from: best ? best.source : "Heuristic",
-        ai_sourced: true
-      };
-
-      // Attach an image for the AI-sourced listing
-      const imgQ = [year, make, model, partHint].filter(Boolean).join(" ");
-      aiProduct.image_url = await fetchImageFromSerpAPI(imgQ) || await fetchImageFromEbay(imgQ) || fallbackImage();
-
-      return res.json({ total: 1, page: 1, page_size: 1, items: [aiProduct] });
-    }
-
-    res.json({ total, page: pg, page_size: ps, items });
-  } catch (e) {
-    res.status(400).json({ error: e.message });
-  }
-});
 
 (async () => {
   if (process.env.DATABASE_URL) {
@@ -432,6 +343,7 @@ app.get("/api/models", (req, res) => res.json(MODELS[req.query.make] || []));
 app.get("/api/years", (_req, res) => res.json([].concat(YEARS_FULL).reverse()));
 app.get("/api/parts", (_req,res)=>res.json(PARTS()));
 
+// Base products (still available for internal use)
 app.get("/api/products", async (req, res) => {
   const { make, model, year, q, oem, min_price, max_price, page, page_size } = req.query;
   const filter = {
@@ -514,7 +426,7 @@ app.post("/api/vin/parts", async (req, res) => {
   } catch(e){ res.status(400).json({ error: e.message }); }
 });
 
-// ---- AI image search & attach ----
+// ---- AI image search helpers ----
 async function fetchImageFromSerpAPI(query){
   if (!SERPAPI_KEY) return null;
   try {
@@ -652,6 +564,88 @@ app.post("/api/market/cheapest", async (req, res) => {
     res.json({ product });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
+
+// ================== ENHANCED SEARCH (auto-image + AI fallback) ==================
+function fallbackImage() {
+  return "https://images.unsplash.com/photo-1517048676732-d65bc937f952?q=80&w=800&auto=format&fit=crop";
+}
+async function ensureImageForProduct(p) {
+  try {
+    if (p.image_url) return p.image_url;
+    const q = [p.year, p.make, p.model, p.part_type].filter(Boolean).join(" ");
+    let url = await fetchImageFromSerpAPI(q);
+    if (!url) url = await fetchImageFromEbay(q);
+    if (!url) url = fallbackImage();
+    await dbUpdateProductImage(p.id, url);
+    p.image_url = url;
+    return url;
+  } catch {
+    p.image_url = p.image_url || fallbackImage();
+    return p.image_url;
+  }
+}
+app.get("/api/search/enhanced", async (req, res) => {
+  try {
+    const { make, model, year, q, oem, min_price, max_price, page, page_size } = req.query;
+    const filter = {
+      make, model,
+      year: year ? parseInt(year,10) : undefined,
+      q: (q||"").toLowerCase(),
+      oemFlag: oem,
+      min: min_price ? parseInt(min_price,10) : undefined,
+      max: max_price ? parseInt(max_price,10) : undefined
+    };
+
+    const list = await (db.useMemory ? db.listProducts(filter) : dbListProducts(filter));
+    const total = list.length;
+
+    const ps = Math.min(parseInt(page_size||"60",10), 200);
+    const pg = Math.max(1, parseInt(page||"1",10));
+    const start = (pg-1)*ps, end = start + ps;
+    let items = list.slice(start, end);
+
+    // Ensure images for a handful of items on this page
+    const NEEDS = items.filter(p => !p.image_url).slice(0, 12);
+    for (const p of NEEDS) { await ensureImageForProduct(p); }
+
+    if (total === 0) {
+      const partHint = (q||"").trim() || "auto part";
+      const queryForMarket = [year, make, model, partHint, "OEM OR Aftermarket"].filter(Boolean).join(" ");
+      let best = await cheapestSerp(queryForMarket);
+      if (!best) best = await cheapestEbay(queryForMarket);
+
+      let sourcePrice = best && best.price ? best.price : (
+        /rotor|radiator|bumper|compressor|converter/i.test(partHint) ? 180 :
+        /alternator|shock|control|bearing|headlight/i.test(partHint) ? 120 :
+        /filter|plug|sensor/i.test(partHint) ? 28 : 75
+      );
+
+      const aiProduct = {
+        id: "ai-" + crypto.randomUUID(),
+        name: `${year||""} ${make||""} ${model||""} – ${partHint} (AI-sourced)`.replace(/\s+/g," ").trim(),
+        make, model, year: year?parseInt(year,10):undefined,
+        part_type: partHint,
+        price_cents: Math.round(sourcePrice * 1.75 * 100),
+        stock: 5,
+        oem: false,
+        image_url: null,
+        source_price: sourcePrice,
+        source_link: best ? best.link : null,
+        source_from: best ? best.source : "Heuristic",
+        ai_sourced: true
+      };
+      const imgQ = [year, make, model, partHint].filter(Boolean).join(" ");
+      aiProduct.image_url = await fetchImageFromSerpAPI(imgQ) || await fetchImageFromEbay(imgQ) || fallbackImage();
+
+      return res.json({ total: 1, page: 1, page_size: 1, items: [aiProduct] });
+    }
+
+    res.json({ total, page: pg, page_size: ps, items });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+// ===============================================================================
 
 // ---- Shipping rates (EasyPost or heuristic) ----
 function ozFromLb(lb){ return Math.max(1, Math.round(lb * 16)); }
@@ -794,6 +788,7 @@ async function queueDropship(order){
 }
 
 // ---- Frontend (eBay-style) via heredoc (safe with backticks inside) ----
+// NOTE: doSearch() now uses '/api/search/enhanced' (the new route)
 app.get("/", (_req, res) => {
   const html = heredoc(function () {/*!
 <!doctype html>
@@ -985,6 +980,7 @@ async function decodeVIN(){
 }
 function selectedOem(){ const el=document.querySelector('input[name="oem"]:checked'); return el?el.value:""; }
 
+// >>>>>>>>>>>>> CHANGE: use the enhanced search endpoint <<<<<<<<<<<<<
 async function doSearch(reset){
   if (reset){ page=1; listEl.innerHTML=''; total=0; }
   const params = new URLSearchParams();
@@ -997,12 +993,15 @@ async function doSearch(reset){
   const min = parseInt(document.getElementById('minPrice').value||''); if(min) params.set('min_price', min*100);
   const max = parseInt(document.getElementById('maxPrice').value||''); if(max) params.set('max_price', max*100);
   params.set('page', page); params.set('page_size', pageSize);
-  const res = await fetch('/api/products?'+params.toString()); const js = await res.json();
+  // Enhanced search provides auto-image + AI fallback
+  const res = await fetch('/api/search/enhanced?'+params.toString());
+  const js = await res.json();
   total = js.total; resultCount.textContent = total + ' results';
   renderItems(js.items);
   const more = page * pageSize < total; document.getElementById('loadMore').style.display = more ? 'block' : 'none';
   if (more) page += 1;
 }
+
 function renderItems(items){
   if (!items.length && !listEl.children.length){ listEl.innerHTML='<div class="helper" style="padding:12px">No items found.</div>'; return; }
   const frag = document.createDocumentFragment();
@@ -1013,8 +1012,8 @@ function renderItems(items){
       + '<img class="thumb" src="'+(p.image_url || '')+'" alt="">'
       + '<div>'
       +   '<div class="title">'+p.name+' '+(p.stock>0?'<span class="badge">In stock</span>':'<span class="badge" style="opacity:.6">Backorder</span>')+'</div>'
-      +   '<div class="meta">'+p.part_type+' • '+(p.oem?'OEM':'Aftermarket')+'</div>'
-      +   '<div class="meta">Make/Model/Year: '+p.make+' / '+p.model+' / '+p.year+'</div>'
+      +   '<div class="meta">'+(p.part_type||'Part')+' • '+(p.oem?'OEM':'Aftermarket')+(p.ai_sourced?' • AI-sourced':'')+'</div>'
+      +   '<div class="meta">Make/Model/Year: '+(p.make||'—')+' / '+(p.model||'—')+' / '+(p.year||'—')+'</div>'
       +   (p.image_url ? '' : '<button class="btnFind" style="padding:8px;border:1px solid var(--line);border-radius:8px;background:#0f0f0f;color:#fff;cursor:pointer;margin-top:6px">Find Photo (AI)</button>')
       + '</div>'
       + '<div>'
