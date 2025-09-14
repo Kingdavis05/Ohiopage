@@ -1,5 +1,6 @@
 // server.js
-// Ohio Auto Parts – Full single-file store: Express + Postgres (optional) + Stripe + Frontend + Shipping Rates
+// Ohio Auto Parts – Full single-file store: Express + Postgres (optional) + Stripe + Frontend
+// Adds: Shipping rates + VIN search/decoder + OEM/Aftermarket filter + visual car-parts background
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -48,6 +49,7 @@ function memoryDB() {
       return state.products.filter(p =>
         (!filter.make || p.make === filter.make) &&
         (!filter.model || p.model === filter.model) &&
+        (!filter.oemFlag || (filter.oemFlag === "oem" ? p.oem : !p.oem)) &&
         (!filter.q || (p.name.toLowerCase().includes(filter.q) || p.part_type.toLowerCase().includes(filter.q)))
       );
     },
@@ -72,7 +74,8 @@ async function migrate() {
       weight_lb real default 2.0,
       dim_l_in real default 10.0,
       dim_w_in real default 8.0,
-      dim_h_in real default 4.0
+      dim_h_in real default 4.0,
+      oem boolean default true
     );
     create table if not exists orders(
       id text primary key,
@@ -90,7 +93,7 @@ async function migrate() {
   `);
 }
 
-// Seed products with weight/dims for shipping
+// ====== Data seeds ======
 function sampleProducts() {
   const pick = (arr)=>arr[Math.floor(Math.random()*arr.length)];
   const MAKES = ["Ford","Chevrolet","GMC","Ram","BMW","Mercedes-Benz","Audi","Volkswagen","Porsche","Volvo","Peugeot","Renault","Citroën","Fiat","Alfa Romeo","Škoda","Dacia","Land Rover","Jaguar","Mini","SEAT","Cupra","Opel","Tesla"];
@@ -136,7 +139,7 @@ function sampleProducts() {
     "https://images.unsplash.com/photo-1511919884226-fd3cad34687c?q=80&w=800&auto=format&fit=crop"
   ];
   const out = [];
-  for (let i=0;i<140;i++){
+  for (let i=0;i<160;i++){
     const make = pick(MAKES);
     const model = pick(MODELS[make]);
     const [part, weight_lb, L, W, H] = pick(PARTS);
@@ -149,7 +152,8 @@ function sampleProducts() {
       price_cents: price,
       stock: Math.floor(Math.random()*15)+2,
       image_url: pick(imgs),
-      weight_lb, dim_l_in: L, dim_w_in: W, dim_h_in: H
+      weight_lb, dim_l_in: L, dim_w_in: W, dim_h_in: H,
+      oem: Math.random() < 0.5 // OEM or Aftermarket
     });
   }
   return out;
@@ -162,11 +166,11 @@ async function ensureSeed() {
   } else {
     const { rows } = await pgPool.query("select count(*)::int as c from products");
     if (rows[0].c < 40) {
-      const q = `insert into products(id,name,make,model,part_type,price_cents,stock,image_url,weight_lb,dim_l_in,dim_w_in,dim_h_in)
-                 values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+      const q = `insert into products(id,name,make,model,part_type,price_cents,stock,image_url,weight_lb,dim_l_in,dim_w_in,dim_h_in,oem)
+                 values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
                  on conflict (id) do nothing`;
       for (const p of items) {
-        await pgPool.query(q,[p.id,p.name,p.make,p.model,p.part_type,p.price_cents,p.stock,p.image_url,p.weight_lb,p.dim_l_in,p.dim_w_in,p.dim_h_in]);
+        await pgPool.query(q,[p.id,p.name,p.make,p.model,p.part_type,p.price_cents,p.stock,p.image_url,p.weight_lb,p.dim_l_in,p.dim_w_in,p.dim_h_in,p.oem]);
       }
     }
   }
@@ -179,6 +183,10 @@ async function dbListProducts(filter) {
   let where = [], vals = [];
   if (filter.make) { vals.push(filter.make); where.push(`make = $${vals.length}`); }
   if (filter.model){ vals.push(filter.model); where.push(`model = $${vals.length}`); }
+  if (filter.oemFlag){
+    if (filter.oemFlag === "oem") where.push(`oem = true`);
+    else if (filter.oemFlag === "aftermarket") where.push(`oem = false`);
+  }
   if (q){ vals.push(`%${q}%`); where.push(`(lower(name) like $${vals.length} or lower(part_type) like $${vals.length})`); }
   const sql = `select * from products ${where.length?'where '+where.join(' and '):''} order by name limit 100`;
   const { rows } = await pgPool.query(sql, vals);
@@ -298,16 +306,57 @@ const PARTS = ["Alternator","Battery","Starter","Spark Plugs","Ignition Coils","
   "AC Compressor","Condenser","Heater Core","Power Steering Pump","Rack and Pinion","Clutch Kit","Flywheel","Transmission Filter/Fluid",
   "Headlight Assembly","Taillight","Mirror","Bumper","Fender","Hood","Grille","Door Handle","Window Regulator","Wiper Blades","Floor Mats","Roof Rack","Infotainment Screen"];
 
+// ====== VIN Decoder (basic WMI + model year) ======
+const VIN_YEAR = (()=>{ // map 10th char → year (1980–2039 cycle)
+  const order = "ABCDEFGHJKLMNPRSTVWXY123456789";
+  const map = {};
+  let year = 1980;
+  for (const ch of order) { map[ch] = year++; if (year>2039) break; }
+  return map;
+})();
+const VIN_WMI = [
+  // USA
+  { p:"1FA", make:"Ford", country:"US" }, { p:"1FB", make:"Ford", country:"US" }, { p:"1FM", make:"Ford", country:"US" },
+  { p:"1G", make:"Chevrolet", country:"US" }, { p:"1GC", make:"Chevrolet", country:"US" }, { p:"1GT", make:"GMC", country:"US" },
+  { p:"1C", make:"Chrysler", country:"US" }, { p:"1D", make:"Dodge", country:"US" }, { p:"1J", make:"Jeep", country:"US" },
+  { p:"1G6", make:"Cadillac", country:"US" }, { p:"1L", make:"Lincoln", country:"US" }, { p:"5YJ", make:"Tesla", country:"US" },
+  // Germany
+  { p:"WBA", make:"BMW", country:"DE" }, { p:"WBS", make:"BMW", country:"DE" },
+  { p:"WDB", make:"Mercedes-Benz", country:"DE" }, { p:"WDD", make:"Mercedes-Benz", country:"DE" },
+  { p:"WAU", make:"Audi", country:"DE" }, { p:"WVW", make:"Volkswagen", country:"DE" }, { p:"WP0", make:"Porsche", country:"DE" },
+  // UK/EU
+  { p:"SCC", make:"Lotus", country:"UK" }, { p:"SAJ", make:"Jaguar", country:"UK" }, { p:"SAL", make:"Land Rover", country:"UK" },
+  { p:"VF3", make:"Peugeot", country:"FR" }, { p:"VF1", make:"Renault", country:"FR" }, { p:"ZFA", make:"Fiat", country:"IT" },
+  { p:"ZAR", make:"Alfa Romeo", country:"IT" }, { p:"TMB", make:"Škoda", country:"CZ" }, { p:"UU1", make:"Dacia", country:"RO" },
+  // More common WMIs
+  { p:"YV1", make:"Volvo", country:"SE" }, { p:"TRU", make:"Audi", country:"DE" }, { p:"W0L", make:"Opel", country:"DE" },
+];
+function decodeVIN(vin) {
+  const clean = (vin||"").toUpperCase().replace(/[^A-Z0-9]/g,"");
+  if (clean.length !== 17) return { ok:false, error:"VIN must be 17 characters." };
+  // model year
+  const yChar = clean[9];
+  const year = VIN_YEAR[yChar] || null;
+  // WMI (first 3 chars) match by prefix list (some use 2–3 chars)
+  let make=null, country=null;
+  const p3 = clean.slice(0,3), p2 = clean.slice(0,2), p1 = clean.slice(0,1);
+  for (const r of VIN_WMI) {
+    if (p3.startsWith(r.p) || p2.startsWith(r.p) || p1.startsWith(r.p)) { make=r.make; country=r.country; break; }
+  }
+  return { ok:true, vin:clean, make, year, country };
+}
+
 // ====== API: Basics ======
 app.get("/config", (_req, res) => res.json({ publishableKey: STRIPE_PUBLISHABLE_KEY }));
 app.get("/api/makes", (_req, res) => res.json(MAKES));
 app.get("/api/models", (req, res) => res.json(MODELS[req.query.make] || []));
 app.get("/api/parts", (_req, res) => res.json(PARTS));
+app.get("/api/vin/decode", (req, res) => res.json(decodeVIN(req.query.vin || "")));
 
 app.get("/api/products", async (req, res) => {
-  const { make, model, q } = req.query;
-  const list = db.useMemory ? await db.listProducts({ make, model, q: (q||"").toLowerCase() })
-                            : await dbListProducts({ make, model, q: (q||"").toLowerCase() });
+  const { make, model, q, oem } = req.query;
+  const list = db.useMemory ? await db.listProducts({ make, model, q: (q||"").toLowerCase(), oemFlag: oem })
+                            : await dbListProducts({ make, model, q: (q||"").toLowerCase(), oemFlag: oem });
   res.json(list);
 });
 
@@ -318,51 +367,49 @@ app.post("/admin/seed", async (req, res) => {
   res.json({ ok: true });
 });
 
-// ====== SHIPPING RATES (FedEx, UPS, DHL, Freight – heuristic) ======
+// ====== SHIPPING RATES (heuristic: FedEx/UPS/DHL/Freight) ======
 app.post("/api/shipping/rates", async (req, res) => {
   try {
     const { address = {}, cart = [], subtotal_cents = 0 } = req.body || {};
     const { country = "US", state = "", city = "", postal_code = "", residential = true } = address || {};
 
-    // Aggregate to a single shipment (simple heuristic)
+    // Aggregate to a single shipment
     let totalWeightLb = 0, dimL=0, dimW=0, dimH=0;
     for (const item of cart) {
       const p = await dbGetProduct(item.id); if (!p) continue;
       const qty = Math.max(1, parseInt(item.qty||1,10));
       totalWeightLb += (p.weight_lb||2) * qty;
-      // approximate dimensions stacking
       dimL = Math.max(dimL, p.dim_l_in||10);
       dimW = Math.max(dimW, p.dim_w_in||8);
       dimH += (p.dim_h_in||4) * qty;
     }
     if (totalWeightLb <= 0) totalWeightLb = 2;
 
-    const billable = Math.max(totalWeightLb, (dimL*dimW*dimH)/139); // dimensional divisor 139
+    const billable = Math.max(totalWeightLb, (dimL*dimW*dimH)/139);
     const domestic = (country || "US").toUpperCase() === "US";
 
-    // Zone factor (US: by ZIP first digit; Intl: multiplier)
+    // Zone factor
     let zoneMult = 1.0;
     if (domestic) {
       const z = String(postal_code||"").trim()[0] || "5";
       const table = { "0":1.00,"1":0.95,"2":0.98,"3":1.05,"4":1.10,"5":1.15,"6":1.20,"7":1.25,"8":1.28,"9":1.32 };
       zoneMult = table[z] ?? 1.15;
     } else {
-      zoneMult = 1.65; // intl base uplift
+      zoneMult = 1.65;
     }
 
-    const fuel = 0.12; // 12% fuel surcharge
+    const fuel = 0.12;
     const residentialFee = residential ? 4.0 : 0.0;
-    const remoteFee = (!domestic && /AU|NZ|ZA|BR|AR|CL|AE|SA|IN|ID|PH|CN|JP|KR/.test(country.toUpperCase())) ? 8.0 : 0.0;
-    const insurance = Math.max(1.0, Math.min(50.0, 0.01 * (subtotal_cents/100))); // ~1% of subtotal, capped
+    const remoteFee = (!domestic && /AU|NZ|ZA|BR|AR|CL|AE|SA|IN|ID|PH|CN|JP|KR/.test((country||"").toUpperCase())) ? 8.0 : 0.0;
+    const insurance = Math.max(1.0, Math.min(50.0, 0.01 * (subtotal_cents/100)));
 
-    // Base rate functions (USD)
     function baseGround(bw){ return 8 + 0.55*bw; }
     function base2Day(bw){ return 15 + 0.95*bw; }
     function baseOvernight(bw){ return 24 + 1.45*bw; }
     function baseIntlExpress(bw){ return 32 + 1.65*bw; }
-    function baseFreight(bw){ return 120 + 0.9*bw; } // LTL
+    function baseFreight(bw){ return 120 + 0.9*bw; }
 
-    const isFreight = billable > 150; // LTL threshold
+    const isFreight = billable > 150;
     let quotes = [];
 
     if (!isFreight && domestic) {
@@ -376,7 +423,6 @@ app.post("/api/shipping/rates", async (req, res) => {
       ];
       quotes = services.map(s => priceOut(s.carrier, s.service, s.days, s.base));
     } else if (!isFreight && !domestic) {
-      // International small parcel → DHL Express + UPS Worldwide Saver + FedEx Intl Priority (heuristics)
       const services = [
         { carrier:"DHL", service:"Express Worldwide", days:4, base: baseIntlExpress(billable) },
         { carrier:"UPS", service:"Worldwide Saver", days:5, base: baseIntlExpress(billable) * 1.05 },
@@ -384,13 +430,11 @@ app.post("/api/shipping/rates", async (req, res) => {
       ];
       quotes = services.map(s => priceOut(s.carrier, s.service, s.days, s.base));
     } else {
-      // Freight (LTL)
       const econ = priceOut("Freight", "LTL Economy", 5, baseFreight(billable));
       const pri = priceOut("Freight", "LTL Priority", 3, baseFreight(billable) * 1.18);
       quotes = [econ, pri];
     }
 
-    // helper to finalize cents
     function toCents(n){ return Math.max(1, Math.round(n*100)); }
     function priceOut(carrier, service, days, base){
       let amt = base * zoneMult;
@@ -407,9 +451,7 @@ app.post("/api/shipping/rates", async (req, res) => {
       };
     }
 
-    // Sort cheapest first
     quotes.sort((a,b)=>a.amount_cents - b.amount_cents);
-
     res.json({ quotes, computed: { billable_lb: Math.round(billable*10)/10, domestic, totalWeightLb, dim: [dimL,dimW,dimH] } });
   } catch (e) {
     console.error("shipping rates error:", e);
@@ -421,7 +463,6 @@ app.post("/api/shipping/rates", async (req, res) => {
 app.post("/create-payment-intent", async (req, res) => {
   try {
     const { cart = [], currency = "usd", email, shipping = null } = req.body || {};
-    // Compute subtotal server-side
     let subtotal = 0;
     const compactItems = [];
     for (const item of cart) {
@@ -455,7 +496,7 @@ app.post("/create-payment-intent", async (req, res) => {
   }
 });
 
-// ====== FRONTEND (UI with address + rates + cart + checkout) ======
+// ====== FRONTEND (VIN + OEM/Aftermarket + Background visuals) ======
 app.get("/", (_req, res) => {
   res.type("html").send(`<!doctype html>
 <html lang="en"><head>
@@ -464,12 +505,25 @@ app.get("/", (_req, res) => {
 <link rel="preconnect" href="https://js.stripe.com"/>
 <style>
 :root{--bg:#0b1220;--card:#0e1a2d;--primary:#00d1ff;--accent:#00ffa3;--text:#eef3ff;--muted:#9fb2d3;--line:rgba(255,255,255,.08)}
-*{box-sizing:border-box}body{margin:0;background:linear-gradient(135deg,#081024,#0b1220 45%,#0e1b2c);color:var(--text);font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+*{box-sizing:border-box}
+body{
+  margin:0;color:var(--text);font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+  background:linear-gradient(135deg,#081024,#0b1220 45%,#0e1b2c);
+}
+body::before{
+  content:""; position:fixed; inset:0; z-index:-1; opacity:.16;
+  background-image:
+    radial-gradient(60px 60px at 20% 20%, rgba(0,209,255,.15), transparent 60%),
+    radial-gradient(60px 60px at 80% 30%, rgba(0,255,163,.15), transparent 60%),
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='420' height='420' viewBox='0 0 420 420'%3E%3Cg fill='none' stroke='%23bcd0ef' stroke-opacity='.25'%3E%3Cpath d='M30 40h120l15 20h90l15-20h120l-30 40H60z'/%3E%3Ccircle cx='210' cy='210' r='28'/%3E%3Crect x='40' y='300' width='120' height='28' rx='6'/%3E%3Crect x='260' y='80' width='110' height='28' rx='6'/%3E%3Cpath d='M100 210h80l10 16h40l10-16h80'/%3E%3C/g%3E%3C/svg%3E");
+  background-size: auto, auto, 420px 420px;
+  background-repeat: no-repeat, no-repeat, repeat;
+}
 header{position:sticky;top:0;z-index:20;padding:20px 16px;background:linear-gradient(180deg,rgba(8,16,36,.9),rgba(8,16,36,.45),transparent);border-bottom:1px solid var(--line);backdrop-filter:saturate(1.1) blur(8px)}
 .container{max-width:1180px;margin:0 auto;padding:0 16px}.brand{display:flex;gap:12px;align-items:center}
 .logo{width:42px;height:42px;border-radius:12px;background:radial-gradient(60% 60% at 30% 30%,var(--primary),transparent 60%),radial-gradient(60% 60% at 75% 70%,var(--accent),transparent 60%),linear-gradient(135deg,#0b1a2c,#0d2037);box-shadow:0 0 30px rgba(0,209,255,.25), inset 0 0 12px rgba(0,255,163,.18)}
 h1{margin:0;font-size:1.6rem}.subtitle{color:var(--muted);font-size:.95rem;margin-top:3px}
-main{padding:26px 0 70px}.grid{display:grid;gap:16px}@media(min-width:1080px){.grid{grid-template-columns:1.6fr 1.4fr 1.2fr}}
+main{padding:26px 0 70px}.grid{display:grid;gap:16px}@media(min-width:1180px){.grid{grid-template-columns:1.4fr 1.2fr 1.2fr}}
 .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:16px;box-shadow:0 8px 28px rgba(0,0,0,.35)}
 label{display:block;margin-bottom:8px;color:#cfe1ff}input,select,button{width:100%;padding:12px 14px;border-radius:12px;border:1px solid var(--line);background:#0c1526;color:var(--text);outline:none}
 input:focus,select:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(0,209,255,.22)}
@@ -485,28 +539,47 @@ input:focus,select:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(0
 .tag{padding:8px 10px;border:1px solid var(--line);border-radius:999px;font-size:.85rem;background:#0b1526;color:#d6e5ff;cursor:pointer}
 .totals{display:grid;grid-template-columns:1fr auto;gap:10px;margin-top:8px}
 .rate{display:flex;gap:8px;align-items:center;border:1px solid var(--line);padding:8px;border-radius:10px;background:#0b1526}
+.pill{display:inline-block;padding:6px 10px;border-radius:999px;background:rgba(0,209,255,.12);border:1px solid rgba(0,209,255,.25);margin-left:8px}
+.badge{display:inline-block;padding:4px 8px;border:1px solid rgba(255,255,255,.2);border-radius:999px;font-size:.85rem;margin-left:8px;color:#d9ecff}
+.toggle{display:flex;gap:8px;align-items:center}
 </style>
 </head>
 <body>
 <header><div class="container brand">
   <div class="logo" aria-hidden="true"></div>
-  <div><h1>Ohio Auto Parts <span class="muted">– US • Germany • Europe</span></h1>
-  <div class="subtitle">OEM & aftermarket parts. Fast checkout with Apple Pay & Google Pay.</div></div>
+  <div><h1>Ohio Auto Parts <span class="pill">US • Germany • Europe</span></h1>
+  <div class="subtitle">OEM & aftermarket parts. VIN-matched search. Apple Pay & Google Pay checkout.</div></div>
 </div></header>
 
 <main class="container">
   <section class="grid">
-    <!-- Search / Products -->
+    <!-- VIN + Search -->
     <div class="card">
+      <h2 style="margin:6px 0 10px">VIN Search</h2>
+      <div style="display:grid;grid-template-columns:2fr auto;gap:10px">
+        <input id="vin" maxlength="17" placeholder="Enter 17-character VIN (e.g., 1FA... or WBA...)"/>
+        <button id="decodeVin" class="btn">Decode VIN</button>
+      </div>
+      <div id="vinMeta" class="muted" style="margin-top:8px"></div>
+      <div style="height:1px;background:linear-gradient(90deg,transparent,rgba(255,255,255,.18),transparent);margin:14px 0"></div>
+
       <h2 style="margin:6px 0 10px">Find Parts</h2>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
         <div><label for="make">Make</label><select id="make"><option>Loading…</option></select></div>
         <div><label for="model">Model</label><select id="model" disabled><option>Select a make first</option></select></div>
       </div>
-      <div style="display:grid;grid-template-columns:1fr auto;gap:12px;margin-top:10px">
+      <div style="display:grid;grid-template-columns:1fr auto;gap:12px;margin-top:10px;align-items:end">
         <div><label for="q">Search part</label><input id="q" placeholder="Brake Pads, Alternator, Radiator…"/></div>
-        <div><label>&nbsp;</label><button id="search" class="btn">Search</button></div>
+        <div>
+          <label>Type</label>
+          <div class="toggle">
+            <label><input type="radio" name="oem" value="" checked style="width:auto"> All</label>
+            <label><input type="radio" name="oem" value="oem" style="width:auto"> OEM</label>
+            <label><input type="radio" name="oem" value="aftermarket" style="width:auto"> Aftermarket</label>
+          </div>
+        </div>
       </div>
+      <button id="search" class="btn" style="margin-top:10px">Search</button>
       <div id="results" class="products"></div>
       <div class="parts" id="partsCloud" style="margin-top:10px"></div>
     </div>
@@ -529,22 +602,10 @@ input:focus,select:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(0
           <input id="state" placeholder="State/Province"/>
           <input id="zip" placeholder="ZIP/Postal"/>
           <select id="country">
-            <option value="US" selected>US</option>
-            <option value="CA">CA</option>
-            <option value="GB">GB</option>
-            <option value="DE">DE</option>
-            <option value="FR">FR</option>
-            <option value="IT">IT</option>
-            <option value="ES">ES</option>
-            <option value="NL">NL</option>
-            <option value="SE">SE</option>
-            <option value="NO">NO</option>
-            <option value="DK">DK</option>
-            <option value="IE">IE</option>
-            <option value="AU">AU</option>
-            <option value="NZ">NZ</option>
-            <option value="JP">JP</option>
-            <option value="KR">KR</option>
+            <option value="US" selected>US</option><option value="CA">CA</option><option value="GB">GB</option>
+            <option value="DE">DE</option><option value="FR">FR</option><option value="IT">IT</option><option value="ES">ES</option>
+            <option value="NL">NL</option><option value="SE">SE</option><option value="NO">NO</option><option value="DK">DK</option>
+            <option value="IE">IE</option><option value="AU">AU</option><option value="NZ">NZ</option><option value="JP">JP</option><option value="KR">KR</option>
           </select>
         </div>
         <label style="display:flex;gap:8px;margin-top:8px;align-items:center">
@@ -564,19 +625,19 @@ input:focus,select:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(0
       <div id="payment-element" style="margin-top:10px"></div>
       <button id="pay" class="btn" style="margin-top:12px">Pay Now</button>
       <div id="message" class="status"></div>
-      <div class="muted" style="margin-top:10px">You’ll see Apple Pay / Google Pay if your device supports it.</div>
+      <div class="muted" style="margin-top:10px">Apple Pay / Google Pay shows when supported.</div>
     </div>
   </section>
 </main>
 
-<script src="https://js.stripe.com/v3/"></script>
+<script src="https://js.stripe.com/v3"></script>
 <script>
 const fmt = (c)=>'$'+(c/100).toFixed(2);
 const partsCloudEl = document.getElementById('partsCloud');
 const makeEl=document.getElementById('make'), modelEl=document.getElementById('model'), qEl=document.getElementById('q');
+const vinEl=document.getElementById('vin'), vinMeta=document.getElementById('vinMeta');
 const cart = []; let selectedRate=null; let subtotalCents=0;
 
-// Load dropdowns and parts tags
 async function loadMakes(){ const r=await fetch('/api/makes'); const a=await r.json();
   makeEl.innerHTML='<option value="">Select a make</option>'+a.map(x=>'<option>'+x+'</option>').join(''); }
 async function loadModels(make){ modelEl.disabled=true; modelEl.innerHTML='<option>Loading…</option>';
@@ -585,14 +646,45 @@ async function loadModels(make){ modelEl.disabled=true; modelEl.innerHTML='<opti
 async function loadParts(){ const r=await fetch('/api/parts'); const a=await r.json();
   partsCloudEl.innerHTML=a.map(p=>'<button type="button" class="tag" data-p="'+p.replace(/"/g,'&quot;')+'">'+p+'</button>').join('');
   partsCloudEl.querySelectorAll('button').forEach(b=>b.addEventListener('click',()=>{ qEl.value=b.dataset.p; })); }
-
 makeEl.addEventListener('change', (e)=>{ if(e.target.value) loadModels(e.target.value); });
 
-async function search(){
-  const params=new URLSearchParams(); if(makeEl.value) params.set('make',makeEl.value);
-  if(modelEl.value) params.set('model',modelEl.value); if(qEl.value) params.set('q',qEl.value);
-  const r=await fetch('/api/products?'+params.toString()); renderResults(await r.json());
+// VIN decode
+document.getElementById('decodeVin').addEventListener('click', async ()=>{
+  const vin = vinEl.value.trim();
+  if (!vin){ vinMeta.textContent="Enter a 17-character VIN."; return; }
+  const r = await fetch('/api/vin/decode?vin='+encodeURIComponent(vin));
+  const d = await r.json();
+  if (!d.ok){ vinMeta.textContent=d.error || "VIN decode failed."; return; }
+  let info = [];
+  if (d.make) info.push(d.make);
+  if (d.year) info.push(d.year);
+  if (d.country) info.push(d.country);
+  vinMeta.innerHTML = 'Decoded: <span class="badge">'+(info.join(" • ")||"Unknown")+'</span>';
+  if (d.make){
+    makeEl.value = d.make;
+    await loadModels(d.make);
+  }
+  // Auto-run a search scoped to decoded make, keeping user part query & OEM/Aftermarket choice
+  search();
+});
+
+// OEM filter
+function selectedOemFlag(){
+  const el = document.querySelector('input[name="oem"]:checked');
+  return el ? el.value : "";
 }
+
+async function search(){
+  const params = new URLSearchParams();
+  if (makeEl.value) params.set('make', makeEl.value);
+  if (modelEl.value) params.set('model', modelEl.value);
+  if (qEl.value) params.set('q', qEl.value);
+  const oem = selectedOemFlag();
+  if (oem) params.set('oem', oem);
+  const r=await fetch('/api/products?'+params.toString());
+  renderResults(await r.json());
+}
+document.getElementById('search').addEventListener('click', search);
 
 function renderResults(items){
   const el=document.getElementById('results');
@@ -601,7 +693,10 @@ function renderResults(items){
     <div class="prod">
       <img src="\${p.image_url||''}" alt="product image"/>
       <div style="font-weight:700">\${p.name}</div>
-      <div class="row"><div class="muted">\${p.part_type}</div><div style="font-weight:800">\${fmt(p.price_cents)}</div></div>
+      <div class="row">
+        <div class="muted">\${p.part_type} · \${p.oem ? 'OEM' : 'Aftermarket'}</div>
+        <div style="font-weight:800">\${fmt(p.price_cents)}</div>
+      </div>
       <button class="btn" data-id="\${p.id}" data-name="\${p.name}" data-price="\${p.price_cents}">Add to Cart</button>
     </div>\`).join('');
   el.querySelectorAll('button.btn').forEach(b=>b.addEventListener('click', ()=> addToCart(b.dataset.id,b.dataset.name,parseInt(b.dataset.price,10))));
@@ -708,7 +803,6 @@ async function updateStripe(subtotal, shipping_cents){
   paymentElement = elements.create('payment');
   paymentElement.mount('#payment-element');
 
-  // Payment Request
   if (!paymentRequest) {
     paymentRequest = stripe.paymentRequest({
       country:'US', currency:'usd',
@@ -738,12 +832,11 @@ document.getElementById('pay').addEventListener('click', async ()=>{
   }catch(e){ setMsg(e.message); }
 });
 
-document.getElementById('search').addEventListener('click', search);
-
 (async function boot(){
   await Promise.all([loadMakes(), loadParts()]);
   document.getElementById('model').innerHTML='<option>Select a make first</option>';
   renderCart();
+  document.getElementById('search').addEventListener('click', search);
   await initStripe();
 })();
 </script>
