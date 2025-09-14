@@ -1,16 +1,113 @@
-// server.js — ONE FILE WEB SERVICE
-// Run: node server.js   (Render will use: process.env.PORT)
-// Features: Front page (filters/listings/cart/checkout) + /api/products + /api/orders
-// If db.json exists with { "products": [...] }, it will use that. Otherwise it returns a default catalog with images.
+// server.js — ONE FILE WEB SERVICE with LKQ feed hook
+// How to use on Render:
+// 1) Set env vars if you have LKQ API access:
+//    - LKQ_API_URL       (e.g. https://api.lkqpartner.com/v1/parts?in_stock=true)
+//    - LKQ_API_TOKEN     (optional: sets Authorization: Bearer <token>)
+//    - LKQ_USERNAME      (optional: for Basic auth)
+//    - LKQ_PASSWORD      (optional: for Basic auth)
+//    - LKQ_API_KEY       (optional: sets x-api-key: <key>)
+// 2) Start command: `node server.js`
+// 3) Optional local fallback file: db.json with { "products": [ ... ] }
 
 const http = require("http");
+const https = require("https");
 const fs = require("fs");
 const path = require("path");
 const url = require("url");
 
 const PORT = process.env.PORT || 3000;
 
-function readProducts() {
+/* ------------------- Helpers ------------------- */
+function httpGetJson(urlStr, headers = {}) {
+  return new Promise((resolve, reject) => {
+    try {
+      const u = new URL(urlStr);
+      const lib = u.protocol === "https:" ? https : http;
+      const opts = {
+        method: "GET",
+        hostname: u.hostname,
+        port: u.port || (u.protocol === "https:" ? 443 : 80),
+        path: u.pathname + (u.search || ""),
+        headers: Object.assign({ "Accept": "application/json" }, headers),
+      };
+
+      const req = lib.request(opts, (res) => {
+        let data = "";
+        res.on("data", (chunk) => (data += chunk));
+        res.on("end", () => {
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            try {
+              const json = JSON.parse(data);
+              resolve(json);
+            } catch (e) {
+              reject(new Error("Invalid JSON from LKQ: " + e.message));
+            }
+          } else {
+            reject(new Error("LKQ HTTP " + res.statusCode + ": " + data.slice(0, 300)));
+          }
+        });
+      });
+
+      req.on("error", reject);
+      req.end();
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
+
+function buildAuthHeaders() {
+  const headers = {};
+  if (process.env.LKQ_API_TOKEN) {
+    headers["Authorization"] = "Bearer " + process.env.LKQ_API_TOKEN;
+  }
+  if (process.env.LKQ_USERNAME && process.env.LKQ_PASSWORD) {
+    const basic = Buffer.from(process.env.LKQ_USERNAME + ":" + process.env.LKQ_PASSWORD).toString("base64");
+    headers["Authorization"] = "Basic " + basic;
+  }
+  if (process.env.LKQ_API_KEY) {
+    headers["x-api-key"] = process.env.LKQ_API_KEY;
+  }
+  return headers;
+}
+
+// Normalize various LKQ-like shapes into our product shape
+function normalizeLKQProducts(raw) {
+  const arr = Array.isArray(raw) ? raw : Array.isArray(raw?.parts) ? raw.parts : [];
+  return arr.map((p) => {
+    const veh = p.vehicle || {};
+    const id =
+      p.id ?? p.partId ?? p.partID ?? p.sku ?? p.partNumber ?? ("lkq-" + Math.random().toString(36).slice(2));
+    const name = p.name ?? p.title ?? p.description ?? "Auto Part";
+    const image = p.image ?? p.imageUrl ?? p.img ?? p.thumbnail ?? "";
+    const base =
+      p.base_price ?? p.price ?? p.cost ?? p.unitPrice ?? (typeof p.pricing === "object" ? p.pricing?.price : 0);
+    const year = p.year ?? veh.year ?? "";
+    const make = p.make ?? veh.make ?? "";
+    const model = p.model ?? veh.model ?? "";
+    return {
+      id,
+      name,
+      image,
+      base_price: Number(base || 0),
+      year,
+      make,
+      model,
+    };
+  });
+}
+
+async function readProductsLKQ() {
+  const url = process.env.LKQ_API_URL;
+  if (!url) return null; // not configured
+  const headers = buildAuthHeaders();
+  const json = await httpGetJson(url, headers);
+  const items = normalizeLKQProducts(json);
+  // safety: limit size to avoid giant payloads
+  return items.slice(0, 500);
+}
+
+function readProductsDB() {
   try {
     const p = path.join(__dirname, "db.json");
     if (fs.existsSync(p)) {
@@ -20,7 +117,10 @@ function readProducts() {
   } catch (e) {
     console.warn("db.json read failed:", e.message);
   }
-  // Default catalog with safe, royalty-free placeholder images
+  return null;
+}
+
+function defaultCatalog() {
   return [
     { id: "brake-pads-front", name: "Brake Pads – Front",    image: "https://picsum.photos/seed/brake-pads/800/480",  base_price: 79.99,  year: 2020, make: "Toyota",  model: "Camry" },
     { id: "alternator",       name: "Alternator",            image: "https://picsum.photos/seed/alternator/800/480",  base_price: 199.99, year: 2019, make: "Honda",   model: "Civic" },
@@ -37,6 +137,12 @@ function readProducts() {
   ];
 }
 
+function send(res, code, type, body) {
+  res.writeHead(code, { "Content-Type": type, "Cache-Control": "no-store" });
+  res.end(body);
+}
+
+/* ------------------- HTML storefront ------------------- */
 const HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -140,7 +246,7 @@ const HTML = `<!DOCTYPE html>
   <script>
     const API_URL = (window.location.origin || "").replace(/\\/$/, "");
     const PRODUCTS_ENDPOINT = API_URL + "/api/products";
-    const FLAT_MARKUP = 50;
+    const FLAT_MARKUP = 50; // change if you need a different markup
 
     let PRODUCTS = [];
     const $ = (q)=>document.querySelector(q);
@@ -169,17 +275,17 @@ const HTML = `<!DOCTYPE html>
         const res = await fetch(PRODUCTS_ENDPOINT, {headers:{"Accept":"application/json"}});
         if(!res.ok) throw new Error("API error " + res.status);
         let data = await res.json();
-        PRODUCTS = (Array.isArray(data)?data:data.products||[]).map(function(p){
-          return {
-            id: (p.id!=null?p.id:crypto.randomUUID()),
-            name: (p.name!=null?p.name:(p.title!=null?p.title:"Auto Part")),
-            image: (p.image || "https://picsum.photos/seed/"+Math.floor(Math.random()*1000)+"/600/360"),
-            base: Number((p.base_price!=null?p.base_price:p.price)||0),
-            year: (p.year!=null?p.year:""),
-            make: (p.make!=null?p.make:""),
-            model: (p.model!=null?p.model:"")
-          };
-        }).map(function(p){ p.price = (p.base||0)+FLAT_MARKUP; return p; });
+        // Accept either array or {products:[...]}
+        const list = Array.isArray(data) ? data : (data.products||[]);
+        PRODUCTS = list.map((p)=>({
+          id: p.id ?? crypto.randomUUID(),
+          name: p.name ?? p.title ?? "Auto Part",
+          image: p.image || "https://picsum.photos/seed/"+Math.floor(Math.random()*1000)+"/600/360",
+          base: Number(p.base_price ?? p.price ?? 0),
+          year: p.year ?? "",
+          make: p.make ?? "",
+          model: p.model ?? "",
+        })).map((p)=>({ ...p, price: (p.base||0) + FLAT_MARKUP }));
       }catch(err){
         console.warn("Falling back to sample data:", err.message);
         PRODUCTS = [
@@ -197,19 +303,15 @@ const HTML = `<!DOCTYPE html>
       const makes=[...new Set(PRODUCTS.map(p=>p.make).filter(Boolean))];
       const models=[...new Set(PRODUCTS.map(p=>p.model).filter(Boolean))];
       function fill(sel, arr){
-        sel.innerHTML = '<option value="">' + sel.options[0].text + '</option>' + arr.map(function(v){
-          return '<option value="' + String(v) + '">' + String(v) + '</option>';
-        }).join('');
+        sel.innerHTML = '<option value=\"\">' + sel.options[0].text + '</option>' + arr.map((v)=>'<option value=\"'+String(v)+'\">'+String(v)+'</option>').join('');
       }
       fill(fYear, years); fill(fMake, makes); fill(fModel, models);
     }
-    [fYear,fMake,fModel,fSearch].forEach(function(el){ if(el) el.addEventListener('input', renderCards); });
+    [fYear,fMake,fModel,fSearch].forEach((el)=>{ if(el) el.addEventListener('input', renderCards); });
 
     function filterProducts(){
       const y=fYear.value, m=fMake.value, mo=fModel.value, s=(fSearch.value||'').toLowerCase();
-      return PRODUCTS.filter(function(p){
-        return (!y || String(p.year)===y) && (!m || p.make===m) && (!mo || p.model===mo) && (!s || p.name.toLowerCase().includes(s));
-      });
+      return PRODUCTS.filter((p)=>(!y || String(p.year)===y) && (!m || p.make===m) && (!mo || p.model===mo) && (!s || p.name.toLowerCase().includes(s)));
     }
 
     function renderCards(){
@@ -217,7 +319,7 @@ const HTML = `<!DOCTYPE html>
       const wrap = document.getElementById('cards');
       wrap.innerHTML = '';
       if(!list.length){ wrap.appendChild($el('div',{class:'empty',html:'No parts found. Adjust your filters.'})); return }
-      list.forEach(function(p){
+      list.forEach((p)=>{
         const card = $el('div',{class:'card'},[
           $el('img',{src:p.image,alt:p.name}),
           $el('div',{class:'p'},[
@@ -227,7 +329,7 @@ const HTML = `<!DOCTYPE html>
             $el('button',{class:'btn wide',html:'Add to Cart'})
           ])
         ]);
-        card.querySelector('button').onclick=function(){ cart.add({id:p.id,name:p.name,price:Number(p.price||0)}); };
+        card.querySelector('button').onclick=()=>{ cart.add({id:p.id,name:p.name,price:Number(p.price||0)}); };
         wrap.appendChild(card);
       });
     }
@@ -237,7 +339,7 @@ const HTML = `<!DOCTYPE html>
       const items = cart.get();
       box.innerHTML = '';
       if(!items.length){ box.appendChild($el('div',{class:'empty',html:'Your cart is empty.'})); updateTotals(); return }
-      items.forEach(function(it){
+      items.forEach((it)=>{
         const row = $el('div',{class:'row'},[
           $el('div',{},[$el('div',{class:'name',html:it.name}), $el('div',{class:'meta',html:('$'+it.price.toFixed(2)+' each')})]),
           $el('div',{class:'right'},[
@@ -245,8 +347,8 @@ const HTML = `<!DOCTYPE html>
             $el('button',{class:'btn',html:'Remove'})
           ])
         ]);
-        row.querySelector('.qty').oninput=function(e){ cart.update(it.id, parseInt(e.target.value||'1',10)); updateTotals(); };
-        row.querySelector('button').onclick=function(){ cart.remove(it.id); renderCart(); };
+        row.querySelector('.qty').oninput=(e)=>{ cart.update(it.id, parseInt(e.target.value||'1',10)); updateTotals(); };
+        row.querySelector('button').onclick=()=>{ cart.remove(it.id); renderCart(); };
         box.appendChild(row);
       });
       updateTotals();
@@ -259,7 +361,7 @@ const HTML = `<!DOCTYPE html>
     }
 
     const payBtn = document.getElementById('pay-btn');
-    if(payBtn){ payBtn.addEventListener('click', function(){
+    if(payBtn){ payBtn.addEventListener('click', ()=>{
       alert('✅ Order placed (demo). Wire to Stripe/PayPal on your server if needed.');
       localStorage.removeItem(cart.key);
       window.location.hash = '#/'; renderRoute();
@@ -267,50 +369,61 @@ const HTML = `<!DOCTYPE html>
 
     function renderRoute(){
       const hash = (location.hash||'#/').toLowerCase();
-      ['home','cart','checkout'].forEach(function(p){ document.getElementById('page-'+p).classList.remove('active'); });
+      ['home','cart','checkout'].forEach((p)=>{ document.getElementById('page-'+p).classList.remove('active'); });
       if(hash.indexOf('#/cart')===0){ document.getElementById('page-cart').classList.add('active'); renderCart(); }
       else if(hash.indexOf('#/checkout')===0){ document.getElementById('page-checkout').classList.add('active'); updateTotals(); }
       else { document.getElementById('page-home').classList.add('active'); }
     }
     window.addEventListener('hashchange', renderRoute);
     document.getElementById('yr').textContent = new Date().getFullYear();
-    loadProducts().then(function(){ renderRoute(); });
+    loadProducts().then(()=>{ renderRoute(); });
   </script>
 </body>
 </html>`;
 
-function send(res, code, type, body) {
-  res.writeHead(code, { "Content-Type": type });
-  res.end(body);
-}
+/* ------------------- Server ------------------- */
+const server = http.createServer(async (req, res) => {
+  const { pathname } = url.parse(req.url || "/", true);
 
-const server = http.createServer((req, res) => {
-  const parsed = url.parse(req.url, true);
-  const pathname = parsed.pathname || "/";
-
-  // API: products
   if (pathname === "/api/products" && req.method === "GET") {
-    const products = readProducts();
-    return send(res, 200, "application/json; charset=utf-8", JSON.stringify(products));
+    try {
+      // 1) Try LKQ feed if configured
+      const lkq = await readProductsLKQ();
+      if (lkq && lkq.length) {
+        return send(res, 200, "application/json; charset=utf-8", JSON.stringify(lkq));
+      }
+
+      // 2) Fallback to db.json if present
+      const db = readProductsDB();
+      if (db && db.length) {
+        return send(res, 200, "application/json; charset=utf-8", JSON.stringify(db));
+      }
+
+      // 3) Default catalog
+      return send(res, 200, "application/json; charset=utf-8", JSON.stringify(defaultCatalog()));
+    } catch (e) {
+      console.error("Products API error:", e.message);
+      // graceful fallback even if LKQ fails
+      const db = readProductsDB();
+      return send(res, 200, "application/json; charset=utf-8", JSON.stringify(db || defaultCatalog()));
+    }
   }
 
-  // API: orders (demo)
   if (pathname === "/api/orders" && req.method === "POST") {
     let body = "";
-    req.on("data", chunk => (body += chunk));
+    req.on("data", (c) => (body += c));
     req.on("end", () => {
-      try { JSON.parse(body || "{}"); } catch {}
+      // In production: validate/store + charge via Stripe/PayPal
       return send(res, 201, "application/json; charset=utf-8", JSON.stringify({ ok: true }));
     });
     return;
   }
 
-  // Health check
   if (pathname === "/health") {
     return send(res, 200, "text/plain; charset=utf-8", "ok");
   }
 
-  // Everything else → serve the storefront HTML
+  // Everything else → storefront HTML
   return send(res, 200, "text/html; charset=utf-8", HTML);
 });
 
