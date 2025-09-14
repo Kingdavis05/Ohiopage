@@ -1,51 +1,58 @@
 // server.js
-// Ohio Auto Parts – all-in-one (eBay-style UI + VIN modal + 1991–2026 years + cart/checkout + full results
-// + AI image & cheapest + dropship queue + ENHANCED SEARCH (auto-image + AI fallback))
+// Ohio Auto Parts — Million-dollar edition (all-in-one)
+// Features: eBay-style UI, VIN→MMY, 1991–2026 years, cart + Stripe (Apple/Google Pay),
+// EasyPost live rates (UPS/FedEx/DHL) + freight + heuristics fallback,
+// Enhanced search (auto-image + AI-sourced fallback cheapest×1.75),
+// dropship webhook, admin seed, SEO, robots & sitemap, caching, rate limit, security.
 
 const express = require("express");
 const bodyParser = require("body-parser");
 const crypto = require("crypto");
+const compression = require("compression");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
 
-// ---- tiny helper to safely embed HTML with backticks ----
+// ---------- helpers ----------
 function heredoc(fn) {
   return String(fn)
     .replace(/^[^{]*{\s*\/\*!?/, "")
     .replace(/\*\/\s*}\s*$/, "");
 }
+const nowISO = () => new Date().toISOString();
 
-// ---- ENV ----
+// ---------- ENV ----------
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "sk_test_xxx";
 const STRIPE_PUBLISHABLE_KEY = process.env.STRIPE_PUBLISHABLE_KEY || "pk_test_xxx";
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
 
-const EASYPOST_API_KEY = process.env.EASYPOST_API_KEY || ""; // optional live rates
+const EASYPOST_API_KEY = process.env.EASYPOST_API_KEY || ""; // optional live carrier rates
+const PARTSTECH_API_KEY = process.env.PARTSTECH_API_KEY || ""; // optional OEM catalog
+const SERPAPI_KEY = process.env.SERPAPI_KEY || ""; // optional Google Images/Shopping via SerpAPI
+const EBAY_APP_ID = process.env.EBAY_APP_ID || ""; // optional eBay Finding API
+const DROPSHIP_WEBHOOK_URL = process.env.DROPSHIP_WEBHOOK_URL || ""; // optional fulfillment
+
 const SHIP_FROM_NAME = process.env.SHIP_FROM_NAME || "Ohio Auto Parts";
 const SHIP_FROM_STREET1 = process.env.SHIP_FROM_STREET1 || "123 Warehouse Rd";
 const SHIP_FROM_CITY = process.env.SHIP_FROM_CITY || "Columbus";
+the_state: {
+}
 const SHIP_FROM_STATE = process.env.SHIP_FROM_STATE || "OH";
 const SHIP_FROM_ZIP = process.env.SHIP_FROM_ZIP || "43004";
 const SHIP_FROM_COUNTRY = process.env.SHIP_FROM_COUNTRY || "US";
 const SHIP_FROM_PHONE = process.env.SHIP_FROM_PHONE || "5555555555";
 const SHIP_FROM_EMAIL = process.env.SHIP_FROM_EMAIL || "support@example.com";
 
-// Optional adapters (set the keys in Render for real data)
-const PARTSTECH_API_KEY = process.env.PARTSTECH_API_KEY || ""; // OEM/aftermarket catalog
-const SERPAPI_KEY = process.env.SERPAPI_KEY || ""; // Google Shopping/Images via SerpAPI
-const EBAY_APP_ID  = process.env.EBAY_APP_ID  || ""; // eBay Finding API
-
-// Dropship processing: post orders to your fulfillment webhook
-const DROPSHIP_WEBHOOK_URL = process.env.DROPSHIP_WEBHOOK_URL || ""; // if set, orders are POSTed here
-
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "changeme-admin";
+const GA_ID = process.env.GA_ID || ""; // optional Google Analytics gtag
 
-// ---- GLOBALS / POLYFILLS ----
+// ---------- globals ----------
 try { if (!globalThis.fetch) globalThis.fetch = require("undici").fetch; } catch {}
 process.on("unhandledRejection", e => console.error("[unhandledRejection]", e));
 process.on("uncaughtException", e => console.error("[uncaughtException]", e));
 
 const stripe = require("stripe")(STRIPE_SECRET_KEY);
 
-// ---- DB (memory with optional Postgres) ----
+// ---------- DB (memory with optional Postgres) ----------
 let db = { useMemory: true };
 let pgPool = null;
 
@@ -60,7 +67,7 @@ let pgPool = null;
       await ensureSeed();
       console.log("[DB] Postgres connected");
     } catch (e) {
-      console.warn("[DB] Falling back to in-memory:", e.message);
+      console.warn("[DB] Falling back to memory:", e.message);
       db = memoryDB(); await ensureSeed();
     }
   } else { db = memoryDB(); await ensureSeed(); }
@@ -158,7 +165,7 @@ async function dbSaveOrder(o) {
   return o;
 }
 
-// ---- Seed data ----
+// ---------- seed data ----------
 const YEARS_FULL = Array.from({length:(2026-1991+1)}, (_,i)=>1991+i);
 function sampleProducts() {
   const pick = a => a[Math.floor(Math.random()*a.length)];
@@ -218,7 +225,7 @@ function sampleProducts() {
     "https://images.unsplash.com/photo-1517747614396-d21a78b850e8?q=80&w=800&auto=format&fit=crop"
   ];
   const out = [];
-  for (let i=0;i<520;i++){
+  for (let i=0;i<720;i++){
     const make = pick(MAKES);
     const model = pick(MODELS[make]);
     const [part, weight_lb, L, W, H] = pick(PARTS);
@@ -229,7 +236,7 @@ function sampleProducts() {
       name: year + " " + make + " " + model + " – " + part,
       make, model, year, part_type: part,
       price_cents: price,
-      stock: Math.floor(Math.random()*24),
+      stock: Math.floor(Math.random()*30),
       image_url: Math.random()<0.6 ? pick(imgs) : null,
       weight_lb, dim_l_in: L, dim_w_in: W, dim_h_in: H,
       oem: Math.random() < 0.55
@@ -241,7 +248,7 @@ async function ensureSeed() {
   const items = sampleProducts();
   if (db.useMemory) { await db.seedProducts(items); return; }
   const { rows } = await pgPool.query("select count(*)::int as c from products");
-  if (rows[0].c < 150) {
+  if (rows[0].c < 200) {
     const q = `insert into products(id,name,make,model,year,part_type,price_cents,stock,image_url,weight_lb,dim_l_in,dim_w_in,dim_h_in,oem)
                values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
                on conflict (id) do nothing`;
@@ -251,10 +258,18 @@ async function ensureSeed() {
   }
 }
 
-// ---- App / Webhooks ----
+// ---------- app ----------
 const app = express();
+app.disable("x-powered-by");
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use(compression());
 
-// Stripe webhook must read the raw body:
+// rate limiting on public APIs (helps with bots/crawlers & API costs)
+const limiter = rateLimit({ windowMs: 60_000, max: 180 });
+const strictLimiter = rateLimit({ windowMs: 60_000, max: 60 });
+app.use(["/api","/create-payment-intent","/webhook"], limiter);
+
+// Stripe webhook: raw body
 app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, res) => {
   let event = req.body;
   try {
@@ -284,12 +299,13 @@ app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, r
   res.json({ received: true });
 });
 
-app.use(bodyParser.json());
+// JSON after webhook
+app.use(bodyParser.json({ limit: "1mb" }));
 
 app.get("/healthz", (_req, res) => res.status(200).send("ok"));
 app.get("/config", (_req, res) => res.json({ publishableKey: STRIPE_PUBLISHABLE_KEY }));
 
-// ---- Catalog APIs ----
+// ---------- catalog APIs ----------
 const MAKES = ["Ford","Chevrolet","GMC","Ram","Dodge","Chrysler","Jeep","Cadillac","Buick","Lincoln","Tesla",
   "BMW","Mercedes-Benz","Audi","Volkswagen","Porsche","Opel","Mini","Smart","Volvo","Peugeot","Renault","Citroën","Fiat","Alfa Romeo","Lancia","SEAT","Škoda","Dacia",
   "Land Rover","Jaguar","Aston Martin","Bentley","Rolls-Royce","Lotus","McLaren","Cupra","Iveco"].sort();
@@ -343,7 +359,6 @@ app.get("/api/models", (req, res) => res.json(MODELS[req.query.make] || []));
 app.get("/api/years", (_req, res) => res.json([].concat(YEARS_FULL).reverse()));
 app.get("/api/parts", (_req,res)=>res.json(PARTS()));
 
-// Base products (still available for internal use)
 app.get("/api/products", async (req, res) => {
   const { make, model, year, q, oem, min_price, max_price, page, page_size } = req.query;
   const filter = {
@@ -361,7 +376,7 @@ app.get("/api/products", async (req, res) => {
   res.json({ total: list.length, page: pg, page_size: ps, items: list.slice(start,end) });
 });
 
-// ---- VIN ----
+// ---------- VIN ----------
 async function decodeVIN_NHTSA(vin){
   try{
     const u = new URL("https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVINValues/" + encodeURIComponent(vin) + "?format=json");
@@ -426,9 +441,13 @@ app.post("/api/vin/parts", async (req, res) => {
   } catch(e){ res.status(400).json({ error: e.message }); }
 });
 
-// ---- AI image search helpers ----
+// ---------- AI image + cheapest ----------
+const _imgCache = new Map(); // key -> url
+const _priceCache = new Map(); // key -> {price,title,link,source,ts}
+
 async function fetchImageFromSerpAPI(query){
   if (!SERPAPI_KEY) return null;
+  if (_imgCache.has(query)) return _imgCache.get(query);
   try {
     const url = new URL("https://serpapi.com/search.json");
     url.searchParams.set("engine","google_images");
@@ -442,13 +461,14 @@ async function fetchImageFromSerpAPI(query){
     for (let i=0;i<imgs.length;i++) {
       const it = imgs[i];
       const link = it.original || it.thumbnail || it.source || it.link;
-      if (link && /^https?:\/\//.test(link)) return link;
+      if (link && /^https?:\/\//.test(link)) { _imgCache.set(query, link); return link; }
     }
     return null;
   } catch { return null; }
 }
 async function fetchImageFromEbay(query){
   if (!EBAY_APP_ID) return null;
+  if (_imgCache.has(query)) return _imgCache.get(query);
   try{
     const url = new URL("https://svcs.ebay.com/services/search/FindingService/v1");
     url.searchParams.set("OPERATION-NAME","findItemsByKeywords");
@@ -460,39 +480,20 @@ async function fetchImageFromEbay(query){
     const resp = await fetch(url.toString());
     if (!resp.ok) return null;
     const json = await resp.json();
-    const arr = json.findItemsByKeywordsResponse && json.findItemsByKeywordsResponse[0] &&
-                json.findItemsByKeywordsResponse[0].searchResult &&
-                json.findItemsByKeywordsResponse[0].searchResult[0] &&
-                json.findItemsByKeywordsResponse[0].searchResult[0].item || [];
+    const arr = json.findItemsByKeywordsResponse?.[0]?.searchResult?.[0]?.item || [];
     for (let i=0;i<arr.length;i++) {
       const it = arr[i];
       const img = (it.pictureURLSuperSize && it.pictureURLSuperSize[0]) || (it.galleryURL && it.galleryURL[0]);
-      if (img) return img;
+      if (img) { _imgCache.set(query, img); return img; }
     }
     return null;
   }catch{ return null; }
 }
-app.post("/api/ai/image", async (req, res) => {
-  try {
-    const body = req.body || {};
-    const product_id = body.product_id;
-    const make = body.make, model = body.model, year = body.year, part = body.part;
-    let p = product_id ? await dbGetProduct(product_id) : null;
-    const q = p ? (p.year + " " + p.make + " " + p.model + " " + p.part_type) :
-                  [year, make, model, part].filter(Boolean).join(" ");
-    let url = await fetchImageFromSerpAPI(q);
-    if (!url) url = await fetchImageFromEbay(q);
-    if (!url) url = "https://images.unsplash.com/photo-1517048676732-d65bc937f952?q=80&w=800&auto=format&fit=crop";
-    if (p) { p = await dbUpdateProductImage(p.id, url); }
-    res.json({ ok:true, image_url: url, product: p || null });
-  } catch (e) {
-    res.status(400).json({ ok:false, error: e.message });
-  }
-});
+function fallbackImage(){ return "https://images.unsplash.com/photo-1517048676732-d65bc937f952?q=80&w=800&auto=format&fit=crop"; }
 
-// ---- AI cheapest + 75% markup ----
 async function cheapestSerp(query){
   if (!SERPAPI_KEY) return null;
+  if (_priceCache.has(query)) return _priceCache.get(query);
   try {
     const url = new URL("https://serpapi.com/search.json");
     url.searchParams.set("engine","google_shopping");
@@ -509,11 +510,13 @@ async function cheapestSerp(query){
       const price = parseFloat(String(it.price||"").replace(/[^0-9.]/g,""));
       if (Number.isFinite(price)) { if(!best || price < best.price) best = { price, title: it.title, link: it.link, source: "Google Shopping" }; }
     }
+    if (best) { _priceCache.set(query, best); }
     return best;
   } catch { return null; }
 }
 async function cheapestEbay(query){
   if (!EBAY_APP_ID) return null;
+  if (_priceCache.has(query)) return _priceCache.get(query);
   try{
     const url = new URL("https://svcs.ebay.com/services/search/FindingService/v1");
     url.searchParams.set("OPERATION-NAME","findItemsByKeywords");
@@ -525,29 +528,62 @@ async function cheapestEbay(query){
     const resp = await fetch(url.toString());
     if (!resp.ok) return null;
     const json = await resp.json();
-    const arr = json.findItemsByKeywordsResponse && json.findItemsByKeywordsResponse[0] &&
-                json.findItemsByKeywordsResponse[0].searchResult &&
-                json.findItemsByKeywordsResponse[0].searchResult[0] &&
-                json.findItemsByKeywordsResponse[0].searchResult[0].item || [];
+    const arr = json.findItemsByKeywordsResponse?.[0]?.searchResult?.[0]?.item || [];
     let best=null;
     for (let i=0;i<arr.length;i++) {
       const it = arr[i];
-      const p = parseFloat(it.sellingStatus && it.sellingStatus[0] && it.sellingStatus[0].currentPrice && it.sellingStatus[0].currentPrice[0] && it.sellingStatus[0].currentPrice[0].__value__ || "NaN");
-      const title = it.title && it.title[0];
-      const link = it.viewItemURL && it.viewItemURL[0];
+      const p = parseFloat(it?.sellingStatus?.[0]?.currentPrice?.[0]?.__value__ || "NaN");
+      const title = it.title?.[0]; const link = it.viewItemURL?.[0];
       if (Number.isFinite(p)) { if(!best || p < best.price) best = { price:p, title, link, source:"eBay" }; }
     }
+    if (best) { _priceCache.set(query, best); }
     return best;
   }catch{ return null; }
 }
 function markup75(price){ return Math.round(price * 1.75 * 100); } // to cents
-app.post("/api/market/cheapest", async (req, res) => {
+
+// attach image to product (persist)
+async function ensureImageForProduct(p) {
+  try {
+    if (p.image_url) return p.image_url;
+    const q = [p.year, p.make, p.model, p.part_type].filter(Boolean).join(" ");
+    let url = await fetchImageFromSerpAPI(q);
+    if (!url) url = await fetchImageFromEbay(q);
+    if (!url) url = fallbackImage();
+    await dbUpdateProductImage(p.id, url);
+    p.image_url = url;
+    return url;
+  } catch {
+    p.image_url = p.image_url || fallbackImage();
+    return p.image_url;
+  }
+}
+
+// public endpoints for AI helpers (rate-limited)
+app.post("/api/ai/image", strictLimiter, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const product_id = body.product_id;
+    const make = body.make, model = body.model, year = body.year, part = body.part;
+    let p = product_id ? await dbGetProduct(product_id) : null;
+    const q = p ? (p.year + " " + p.make + " " + p.model + " " + p.part_type) :
+                  [year, make, model, part].filter(Boolean).join(" ");
+    let url = await fetchImageFromSerpAPI(q);
+    if (!url) url = await fetchImageFromEbay(q);
+    if (!url) url = fallbackImage();
+    if (p) { p = await dbUpdateProductImage(p.id, url); }
+    res.json({ ok:true, image_url: url, product: p || null });
+  } catch (e) {
+    res.status(400).json({ ok:false, error: e.message });
+  }
+});
+
+app.post("/api/market/cheapest", strictLimiter, async (req, res) => {
   try {
     const body = req.body || {};
     const make = body.make, model = body.model, year = body.year, part = body.part;
     const q = [year, make, model, part, "OEM OR Aftermarket"].filter(Boolean).join(" ");
-    let best = await cheapestSerp(q);
-    if (!best) best = await cheapestEbay(q);
+    let best = await cheapestSerp(q) || await cheapestEbay(q);
     if (!best) {
       const base = /rotor|radiator|bumper|compressor|converter/i.test(part||"") ? 180
                 : /alternator|shock|control|bearing|headlight/i.test(part||"") ? 120
@@ -565,25 +601,7 @@ app.post("/api/market/cheapest", async (req, res) => {
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
-// ================== ENHANCED SEARCH (auto-image + AI fallback) ==================
-function fallbackImage() {
-  return "https://images.unsplash.com/photo-1517048676732-d65bc937f952?q=80&w=800&auto=format&fit=crop";
-}
-async function ensureImageForProduct(p) {
-  try {
-    if (p.image_url) return p.image_url;
-    const q = [p.year, p.make, p.model, p.part_type].filter(Boolean).join(" ");
-    let url = await fetchImageFromSerpAPI(q);
-    if (!url) url = await fetchImageFromEbay(q);
-    if (!url) url = fallbackImage();
-    await dbUpdateProductImage(p.id, url);
-    p.image_url = url;
-    return url;
-  } catch {
-    p.image_url = p.image_url || fallbackImage();
-    return p.image_url;
-  }
-}
+// ---------- Enhanced search (auto-image + AI fallback) ----------
 app.get("/api/search/enhanced", async (req, res) => {
   try {
     const { make, model, year, q, oem, min_price, max_price, page, page_size } = req.query;
@@ -604,17 +622,14 @@ app.get("/api/search/enhanced", async (req, res) => {
     const start = (pg-1)*ps, end = start + ps;
     let items = list.slice(start, end);
 
-    // Ensure images for a handful of items on this page
     const NEEDS = items.filter(p => !p.image_url).slice(0, 12);
     for (const p of NEEDS) { await ensureImageForProduct(p); }
 
     if (total === 0) {
       const partHint = (q||"").trim() || "auto part";
       const queryForMarket = [year, make, model, partHint, "OEM OR Aftermarket"].filter(Boolean).join(" ");
-      let best = await cheapestSerp(queryForMarket);
-      if (!best) best = await cheapestEbay(queryForMarket);
-
-      let sourcePrice = best && best.price ? best.price : (
+      let best = await cheapestSerp(queryForMarket) || await cheapestEbay(queryForMarket);
+      let sourcePrice = best?.price ?? (
         /rotor|radiator|bumper|compressor|converter/i.test(partHint) ? 180 :
         /alternator|shock|control|bearing|headlight/i.test(partHint) ? 120 :
         /filter|plug|sensor/i.test(partHint) ? 28 : 75
@@ -626,12 +641,9 @@ app.get("/api/search/enhanced", async (req, res) => {
         make, model, year: year?parseInt(year,10):undefined,
         part_type: partHint,
         price_cents: Math.round(sourcePrice * 1.75 * 100),
-        stock: 5,
-        oem: false,
+        stock: 5, oem: false,
         image_url: null,
-        source_price: sourcePrice,
-        source_link: best ? best.link : null,
-        source_from: best ? best.source : "Heuristic",
+        source_price: sourcePrice, source_link: best?.link || null, source_from: best?.source || "Heuristic",
         ai_sourced: true
       };
       const imgQ = [year, make, model, partHint].filter(Boolean).join(" ");
@@ -641,13 +653,10 @@ app.get("/api/search/enhanced", async (req, res) => {
     }
 
     res.json({ total, page: pg, page_size: ps, items });
-  } catch (e) {
-    res.status(400).json({ error: e.message });
-  }
+  } catch (e) { res.status(400).json({ error: e.message }); }
 });
-// ===============================================================================
 
-// ---- Shipping rates (EasyPost or heuristic) ----
+// ---------- Shipping (EasyPost + freight + heuristic) ----------
 function ozFromLb(lb){ return Math.max(1, Math.round(lb * 16)); }
 async function easypostRates({ to, parcel }){
   const url = "https://api.easypost.com/v2/shipments";
@@ -676,17 +685,25 @@ async function easypostRates({ to, parcel }){
     .sort((a,b)=>a.amount_cents-b.amount_cents)
     .slice(0,6);
 }
-function heuristicRates({ domestic, billable, zoneMult, residentialFee, remoteFee, insurance }){
+function heuristicRates({ domestic, billable, zoneMult, residentialFee, remoteFee, insurance, freight }){
   function baseGround(bw){ return 8 + 0.55*bw; }
   function base2Day(bw){ return 15 + 0.95*bw; }
   function baseOvernight(bw){ return 24 + 1.45*bw; }
   function baseIntlExpress(bw){ return 32 + 1.65*bw; }
+  function baseFreight(bw){ return 75 + 2.2*bw; } // very rough LTL heuristic
   function toCents(n){ return Math.max(1, Math.round(n*100)); }
   const fuel = 0.12;
   const quote = (carrier,service,days,base)=>{
     let amt = base * zoneMult; amt += residentialFee + remoteFee + insurance; amt *= 1+fuel;
     return { carrier, service, days, amount_cents: toCents(amt) };
   };
+  if (freight) {
+    return [
+      quote("UPS","Freight LTL",5, baseFreight(billable)),
+      quote("FedEx","Freight Economy",5, baseFreight(billable)*1.03),
+      quote("DHL","Freight",6, baseFreight(billable)*1.06)
+    ].sort((a,b)=>a.amount_cents-b.amount_cents);
+  }
   if (domestic) return [
     quote("UPS","Ground",3, baseGround(billable)),
     quote("FedEx","Ground",3, baseGround(billable)*0.98),
@@ -711,7 +728,8 @@ app.post("/api/shipping/rates", async (req, res) => {
       line1: address.line1||"", line2: address.line2||"", city: address.city||"", state: address.state||"",
       postal_code: address.postal_code||"", country: (address.country||"US").toUpperCase(), residential: !!address.residential
     };
-    // Aggregate to one parcel
+
+    // Aggregate to one parcel (rough)
     let totalWeightLb = 0, dimL=0, dimW=0, dimH=0;
     for (let i=0;i<cart.length;i++) {
       const item = cart[i];
@@ -723,11 +741,13 @@ app.post("/api/shipping/rates", async (req, res) => {
       dimH += (p.dim_h_in||4)*qty;
     }
     if (totalWeightLb<=0) totalWeightLb=2;
-    const billable = Math.max(totalWeightLb, (dimL*dimW*dimH)/139);
     const domestic = to.country==="US";
+    const dimWeight = (dimL*dimW*dimH)/139;
+    const billable = Math.max(totalWeightLb, dimWeight);
+    const freight = (dimL>60 || dimW>48 || dimH>48 || totalWeightLb>100); // simple LTL trigger
 
     let quotes = [];
-    if (EASYPOST_API_KEY && to.postal_code && to.city && to.state && to.line1) {
+    if (!freight && EASYPOST_API_KEY && to.postal_code && to.city && to.state && to.line1) {
       try { quotes = await easypostRates({ to, parcel:{ l:dimL,w:dimW,h:dimH, weight_lb: totalWeightLb } }); } catch(e){ console.warn("EasyPost error:", e.message); }
     }
     if (!quotes.length) {
@@ -735,13 +755,13 @@ app.post("/api/shipping/rates", async (req, res) => {
       const remoteFee = (!domestic && /AU|NZ|ZA|BR|AR|CL|AE|SA|IN|ID|PH|CN|JP|KR/.test(to.country)) ? 8.0 : 0.0;
       const residentialFee = to.residential ? 4.0 : 0.0;
       const insurance = Math.max(1.0, Math.min(50.0, 0.01 * (subtotal_cents/100)));
-      quotes = heuristicRates({ domestic, billable, zoneMult, residentialFee, remoteFee, insurance });
+      quotes = heuristicRates({ domestic, billable, zoneMult, residentialFee, remoteFee, insurance, freight });
     }
     res.json({ quotes });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
-// ---- Payments + dropship ----
+// ---------- Payments + dropship ----------
 app.post("/create-payment-intent", async (req, res) => {
   try {
     const body = req.body || {};
@@ -780,31 +800,61 @@ async function queueDropship(order){
       if (!r.ok) throw new Error("Dropship webhook " + r.status);
       console.log("[dropship] forwarded to webhook");
     } else {
-      console.log("[dropship] webhook not set; order queued in logs only");
+      console.log("[dropship] webhook not set; order queued in logs only", order.id);
     }
   } catch (e) {
     console.error("[dropship] failed:", e.message);
   }
 }
 
-// ---- Frontend (eBay-style) via heredoc (safe with backticks inside) ----
-// NOTE: doSearch() now uses '/api/search/enhanced' (the new route)
+// ---------- SEO: robots + sitemap ----------
+app.get("/robots.txt", (_req, res) => {
+  res.type("text/plain").send(`User-agent: *
+Allow: /
+Sitemap: ${process.env.SITE_URL || ""}/sitemap.xml
+`);
+});
+app.get("/sitemap.xml", async (_req, res) => {
+  const base = (process.env.SITE_URL || "").replace(/\/+$/,"");
+  let urls = [`${base}/`];
+  try {
+    const items = await (db.useMemory ? db.listProducts({}) : dbListProducts({}));
+    urls = urls.concat(items.slice(0, 500).map(p => `${base}/?q=${encodeURIComponent(p.part_type)}&make=${encodeURIComponent(p.make)}&model=${encodeURIComponent(p.model)}&year=${p.year}`));
+  } catch {}
+  res.type("application/xml").send(`<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+${urls.map(u=>`<url><loc>${u}</loc><lastmod>${nowISO()}</lastmod></url>`).join("\n")}
+</urlset>`);
+});
+
+// ---------- Frontend (heredoc: safe for inner backticks) ----------
 app.get("/", (_req, res) => {
-  const html = heredoc(function () {/*!
+  let html = heredoc(function(){/*!
 <!doctype html>
-<html lang="en"><head>
+<html lang="en">
+<head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Ohio Auto Parts</title>
+<title>Ohio Auto Parts – Premium OEM & Aftermarket</title>
+<meta name="description" content="Ohio Auto Parts: VIN-to-exact-fit parts, live shipping rates (UPS/FedEx/DHL), Apple Pay & Google Pay, best-price AI sourcing."/>
 <link rel="preconnect" href="https://js.stripe.com"/>
+<meta property="og:title" content="Ohio Auto Parts"/>
+<meta property="og:description" content="VIN-decoded fitment. Live rates. Apple/Google Pay. AI finds the best price and image."/>
+<meta property="og:type" content="website"/>
+<meta property="og:url" content="__SITE_URL__"/>
+<meta property="og:image" content="https://images.unsplash.com/photo-1517048676732-d65bc937f952?q=80&w=1200&auto=format&fit=crop"/>
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"Organization","name":"Ohio Auto Parts","url":"__SITE_URL__","logo":"https://images.unsplash.com/photo-1517048676732-d65bc937f952?q=80&w=300&auto=format&fit=crop","sameAs":["https://facebook.com","https://instagram.com"]}</script>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='64' height='64'%3E%3Crect width='64' height='64' rx='12' fill='%23111111'/%3E%3Ccircle cx='20' cy='42' r='8' fill='%23d4af37'/%3E%3Ccircle cx='44' cy='42' r='8' fill='%23d4af37'/%3E%3Crect x='12' y='20' width='40' height='14' rx='4' fill='%23ffd76b'/%3E%3C/svg%3E" />
 <style>
 :root{--bg:#0a0a0a;--card:#101010;--panel:#0f0f0f;--line:rgba(255,255,255,.08);--text:#f3f3f3;--muted:#bfbfbf;--gold:#d4af37;--accent:#ffd76b}
 *{box-sizing:border-box}
-body{margin:0;background:linear-gradient(180deg,#000,#0a0a0a 40%,#0e0e0e);color:var(--text);font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+body{margin:0;background:radial-gradient(1200px 600px at 30% -10%, rgba(212,175,55,.15), transparent 60%),linear-gradient(180deg,#000,#0a0a0a 40%,#0e0e0e);color:var(--text);font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
 a{color:#9ecbff}
 header{position:sticky;top:0;z-index:30;background:#000c;border-bottom:1px solid var(--line);backdrop-filter: blur(8px)}
-.topbar{max-width:1280px;margin:0 auto;display:grid;grid-template-columns:180px 1fr 220px;gap:12px;align-items:center;padding:12px 16px}
+.topbar{max-width:1280px;margin:0 auto;display:grid;grid-template-columns:180px 1fr 260px;gap:12px;align-items:center;padding:12px 16px}
 .logo{display:flex;gap:10px;align-items:center}
-.logo .mark{width:38px;height:38px;border-radius:10px;background:radial-gradient(60% 60% at 30% 30%,var(--gold),transparent 60%),linear-gradient(135deg,#141414,#1b1b1b);box-shadow:0 0 24px rgba(212,175,55,.35), inset 0 0 12px rgba(255,255,255,.08)}
+.logo .mark{width:38px;height:38px;border-radius:10px;background:
+  radial-gradient(60% 60% at 30% 30%,var(--gold),transparent 60%),linear-gradient(135deg,#141414,#1b1b1b);
+  box-shadow:0 0 24px rgba(212,175,55,.35), inset 0 0 12px rgba(255,255,255,.08)}
 .logo b{font-size:1.15rem}
 .searchbar{display:flex;gap:8px}
 .searchbar input{flex:1;padding:12px;border-radius:12px;border:1px solid var(--line);background:#0f0f0f;color:var(--text)}
@@ -980,7 +1030,7 @@ async function decodeVIN(){
 }
 function selectedOem(){ const el=document.querySelector('input[name="oem"]:checked'); return el?el.value:""; }
 
-// >>>>>>>>>>>>> CHANGE: use the enhanced search endpoint <<<<<<<<<<<<<
+// Use enhanced search (auto-image + AI fallback)
 async function doSearch(reset){
   if (reset){ page=1; listEl.innerHTML=''; total=0; }
   const params = new URLSearchParams();
@@ -993,7 +1043,6 @@ async function doSearch(reset){
   const min = parseInt(document.getElementById('minPrice').value||''); if(min) params.set('min_price', min*100);
   const max = parseInt(document.getElementById('maxPrice').value||''); if(max) params.set('max_price', max*100);
   params.set('page', page); params.set('page_size', pageSize);
-  // Enhanced search provides auto-image + AI fallback
   const res = await fetch('/api/search/enhanced?'+params.toString());
   const js = await res.json();
   total = js.total; resultCount.textContent = total + ' results';
@@ -1165,20 +1214,31 @@ document.getElementById('pay').onclick = async function(){
 };
 
 init();
+
+// optional Google Analytics
+(function(){
+  var GA_ID="__GA_ID__"; if(!GA_ID) return;
+  var s=document.createElement("script"); s.async=true; s.src="https://www.googletagmanager.com/gtag/js?id="+GA_ID; document.head.appendChild(s);
+  window.dataLayer=window.dataLayer||[]; function gtag(){dataLayer.push(arguments);} window.gtag=gtag;
+  gtag('js', new Date()); gtag('config', GA_ID);
+})();
 </script>
-</body></html>
+</body>
+</html>
 */});
+  const siteURL = (process.env.SITE_URL || "").replace(/\/+$/,"") || "";
+  html = html.replaceAll("__SITE_URL__", siteURL).replaceAll("__GA_ID__", GA_ID);
   res.type("html").send(html);
 });
 
-// Admin seed endpoint
+// ---------- Admin ----------
 app.post("/admin/seed", async (req, res) => {
   const token = (req.headers.authorization||"").split("Bearer ")[1];
   if (token !== ADMIN_PASSWORD) return res.status(401).json({ error: "Unauthorized" });
   await ensureSeed(); res.json({ ok:true });
 });
 
-// ---- Listen ----
+// ---------- listen ----------
 const HOST = "0.0.0.0";
 const PORT = Number(process.env.PORT) || 3000;
 app.listen(PORT, HOST, function(){
