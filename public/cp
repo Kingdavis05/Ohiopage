@@ -1,0 +1,4 @@
+cp ~/Downloads/new_index.html public/index.html
+git add public/index.html
+git commit -m "Add new storefront"
+git push
