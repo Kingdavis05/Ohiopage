@@ -1,0 +1,11 @@
+my-autoparts-store/
+ ├─ pages/
+ │   ├─ _app.js         // App wrapper with CartContext
+ │   ├─ index.js        // Front page with filters + parts
+ │   ├─ cart.js         // Cart page
+ │   └─ checkout.js     // Checkout page
+ ├─ components/
+ │   └─ ui/             // shadcn/ui components (Button, Card)
+ ├─ package.json
+ ├─ tailwind.config.js
+ └─ postcss.config.js
