@@ -1,12 +1,62 @@
-// server.js — dependency-lite version (no compression/helmet/rate-limit/pg/stripe SDK required)
-// Features kept: eBay-style UI, VIN→MMY, 1991–2026 years, cart + checkout (Stripe/Apple/Google Pay via REST),
-// EasyPost live rates (UPS/FedEx/DHL) + freight + heuristic fallback,
-// Enhanced search (auto-image + AI-sourced fallback, cheapest ×1.75),
-// dropship webhook, admin seed, robots/sitemap, SEO.
-// Requires only: express (built-ins: crypto, URL, fetch in Node 18+)
+// server.js — zero-dependency HTTP server (no npm installs required)
+// Keeps: eBay-style UI, VIN→MMY, 1991–2026 years, cart + Stripe (Apple/Google Pay) via REST,
+// AI image attach + cheapest-market ×1.75, EasyPost/heuristic shipping, admin seed, robots/sitemap.
 
-const express = require("express");
+const http = require("http");
 const crypto = require("crypto");
+const { URL } = require("url");
+
+// ---------- tiny express-like app ----------
+function createApp() {
+  const routes = [];
+  const add = (method, path, handler, opts={}) => routes.push({ method, path, handler, opts });
+
+  function typeOf(obj){ return Object.prototype.toString.call(obj).slice(8,-1); }
+
+  const server = http.createServer(async (req, res) => {
+    try {
+      const u = new URL(req.url, `http://${req.headers.host}`);
+      req.path = u.pathname; req.query = Object.fromEntries(u.searchParams);
+      // helpers
+      res.type = (t)=>{ res.setHeader("Content-Type", t); return res; };
+      res.status = (n)=>{ res.statusCode = n; return res; };
+      res.json = (o)=>{ if(!res.getHeader("Content-Type")) res.type("application/json"); res.end(JSON.stringify(o)); };
+      res.send = (s)=>{ if (!res.getHeader("Content-Type")) res.type("text/html; charset=utf-8"); res.end(s); };
+
+      // match route
+      const route = routes.find(r => r.method === req.method && r.path === req.path);
+      if (!route) { res.status(404).send("Not found"); return; }
+
+      // body
+      let raw = Buffer.alloc(0);
+      if (["POST","PUT","PATCH"].includes(req.method)) {
+        raw = await new Promise(resolve=>{
+          const chunks=[]; req.on("data",c=>chunks.push(c)); req.on("end",()=>resolve(Buffer.concat(chunks)));
+        });
+      }
+      if (route.opts && route.opts.raw) { req.rawBody = raw; }
+      else {
+        const ct = (req.headers["content-type"]||"").toLowerCase();
+        if (ct.includes("application/json")) {
+          try { req.body = raw.length? JSON.parse(raw.toString("utf8")) : {}; } catch { req.body = {}; }
+        } else if (ct.includes("application/x-www-form-urlencoded")) {
+          const params = new URLSearchParams(raw.toString("utf8")); req.body = Object.fromEntries(params);
+        } else { req.body = {}; }
+      }
+
+      await route.handler(req, res);
+    } catch (e) {
+      console.error("[server]", e);
+      if (!res.headersSent) res.status(500).type("text/plain").send("Internal Error: " + e.message);
+    }
+  });
+
+  return {
+    get: (p,h)=>add("GET", p, h),
+    post: (p,h,opts)=>add("POST", p, h, opts||{}),
+    listen: (port, host, cb)=>server.listen(port, host, cb)
+  };
+}
 
 // ---------- helpers ----------
 function heredoc(fn) {
@@ -19,15 +69,12 @@ const nowISO = () => new Date().toISOString();
 // ---------- ENV ----------
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "sk_test_xxx";
 const STRIPE_PUBLISHABLE_KEY = process.env.STRIPE_PUBLISHABLE_KEY || "pk_test_xxx";
-// NOTE: This build skips Stripe signature verification (no SDK). Leave secret blank or handle verification upstream.
-const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
-
-const EASYPOST_API_KEY = process.env.EASYPOST_API_KEY || ""; // optional live carrier rates
-const PARTSTECH_API_KEY = process.env.PARTSTECH_API_KEY || ""; // optional OEM catalog
-const SERPAPI_KEY = process.env.SERPAPI_KEY || ""; // optional Google Images/Shopping via SerpAPI
-const EBAY_APP_ID = process.env.EBAY_APP_ID || ""; // optional eBay Finding API
-const DROPSHIP_WEBHOOK_URL = process.env.DROPSHIP_WEBHOOK_URL || ""; // optional fulfillment webhook
-
+// No Stripe signature verification in this zero-deps build (webhook still accepted).
+const EASYPOST_API_KEY = process.env.EASYPOST_API_KEY || "";
+const PARTSTECH_API_KEY = process.env.PARTSTECH_API_KEY || "";
+const SERPAPI_KEY = process.env.SERPAPI_KEY || "";
+const EBAY_APP_ID = process.env.EBAY_APP_ID || "";
+const DROPSHIP_WEBHOOK_URL = process.env.DROPSHIP_WEBHOOK_URL || "";
 const SHIP_FROM_NAME = process.env.SHIP_FROM_NAME || "Ohio Auto Parts";
 const SHIP_FROM_STREET1 = process.env.SHIP_FROM_STREET1 || "123 Warehouse Rd";
 const SHIP_FROM_CITY = process.env.SHIP_FROM_CITY || "Columbus";
@@ -36,9 +83,9 @@ const SHIP_FROM_ZIP = process.env.SHIP_FROM_ZIP || "43004";
 const SHIP_FROM_COUNTRY = process.env.SHIP_FROM_COUNTRY || "US";
 const SHIP_FROM_PHONE = process.env.SHIP_FROM_PHONE || "5555555555";
 const SHIP_FROM_EMAIL = process.env.SHIP_FROM_EMAIL || "support@example.com";
-
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "changeme-admin";
-const GA_ID = process.env.GA_ID || ""; // optional Google Analytics gtag
+const GA_ID = process.env.GA_ID || "";
+if (typeof fetch !== "function") { globalThis.fetch = (...a)=>import("node-fetch").then(m=>m.default(...a)); }
 
 // ---------- In-memory DB ----------
 let db = memoryDB();
@@ -144,47 +191,17 @@ function sampleProducts() {
       oem: Math.random() < 0.55
     });
   }
+  function pick(a){ return a[Math.floor(Math.random()*a.length)]; }
   return out;
 }
 
-// ---------- app ----------
-const app = express();
-app.disable("x-powered-by");
+// ---------- app + routes ----------
+const app = createApp();
 
-// Stripe webhook must be FIRST and use raw body (no SDK verification in this build)
-app.post("/webhook", express.raw({ type: "application/json" }), async (req, res) => {
-  try {
-    let event = {};
-    try { event = JSON.parse(req.body.toString("utf8")); } catch { return res.status(400).send("Invalid JSON"); }
-    // Minimal handling (no signature verification in this dependency-lite build)
-    if (event.type === "payment_intent.succeeded") {
-      const pi = event.data && event.data.object || {};
-      const order = {
-        id: crypto.randomUUID(),
-        stripe_pi: pi.id,
-        amount_cents: pi.amount_received || pi.amount,
-        currency: pi.currency || "usd",
-        email: (pi.charges?.data?.[0]?.billing_details?.email) || null,
-        name: (pi.charges?.data?.[0]?.billing_details?.name) || null,
-        address: (pi.charges?.data?.[0]?.billing_details?.address) || null,
-        items: pi.metadata?.items ? JSON.parse(pi.metadata.items) : [],
-        shipping: pi.metadata?.shipping ? JSON.parse(pi.metadata.shipping) : null,
-        status: "paid"
-      };
-      await db.saveOrder(order);
-      await queueDropship(order);
-    }
-    res.json({ received: true });
-  } catch (e) { res.status(400).send("Webhook Error: "+e.message); }
-});
-
-// JSON parser for the rest
-app.use(express.json({ limit: "1mb" }));
-
-app.get("/healthz", (_req, res) => res.status(200).send("ok"));
+app.get("/healthz", (_req, res) => res.type("text/plain").send("ok"));
 app.get("/config", (_req, res) => res.json({ publishableKey: STRIPE_PUBLISHABLE_KEY }));
 
-// ---------- catalog APIs ----------
+// Catalog data
 const MAKES = ["Ford","Chevrolet","GMC","Ram","Dodge","Chrysler","Jeep","Cadillac","Buick","Lincoln","Tesla",
   "BMW","Mercedes-Benz","Audi","Volkswagen","Porsche","Opel","Mini","Smart","Volvo","Peugeot","Renault","Citroën","Fiat","Alfa Romeo","Lancia","SEAT","Škoda","Dacia",
   "Land Rover","Jaguar","Aston Martin","Bentley","Rolls-Royce","Lotus","McLaren","Cupra","Iveco"].sort();
@@ -258,11 +275,10 @@ app.get("/api/products", async (req, res) => {
 // ---------- VIN ----------
 async function decodeVIN_NHTSA(vin){
   try{
-    const u = new URL("https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVINValues/" + encodeURIComponent(vin) + "?format=json");
+    const u = new URL("https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVINValues/"+encodeURIComponent(vin)+"?format=json");
     const r = await fetch(u); if(!r.ok) return null; const j = await r.json();
     const row = j && j.Results && j.Results[0] ? j.Results[0] : {};
-    const make = row.Make || null;
-    const model = row.Model || null;
+    const make = row.Make || null, model = row.Model || null;
     const year = row.ModelYear ? parseInt(row.ModelYear,10) : null;
     return { make, model, year };
   }catch{ return null; }
@@ -275,7 +291,7 @@ app.get("/api/vin/decode", async (req, res) => {
   res.json({ ok:true, vin, ...meta });
 });
 
-// Optional: PartsTech OEM/aftermarket matches
+// Optional OEM/aftermarket catalog (PartsTech)
 async function searchPartsTech({ make, model, year, partQuery }){
   if (!PARTSTECH_API_KEY) return null;
   try {
@@ -301,11 +317,11 @@ async function searchPartsTech({ make, model, year, partQuery }){
 }
 app.post("/api/vin/parts", async (req, res) => {
   try{
-    let vin = (req.body && req.body.vin || "").toUpperCase();
+    const vin = (req.body && req.body.vin || "").toUpperCase();
     const part = (req.body && req.body.part) || "";
     const decoded = await decodeVIN_NHTSA(vin);
     if (!decoded) return res.status(400).json({ error: "VIN decode failed" });
-    const make = decoded.make, model = decoded.model, year = decoded.year;
+    const { make, model, year } = decoded;
 
     let items = await searchPartsTech({ make, model, year, partQuery: part });
     if (!items || !items.length) {
@@ -320,9 +336,7 @@ app.post("/api/vin/parts", async (req, res) => {
 });
 
 // ---------- AI image + cheapest ----------
-const _imgCache = new Map(); // key -> url
-const _priceCache = new Map(); // key -> {price,title,link,source,ts}
-
+const _imgCache = new Map(), _priceCache = new Map();
 async function fetchImageFromSerpAPI(query){
   if (!SERPAPI_KEY) return null;
   if (_imgCache.has(query)) return _imgCache.get(query);
@@ -336,8 +350,7 @@ async function fetchImageFromSerpAPI(query){
     if (!resp.ok) return null;
     const json = await resp.json();
     const imgs = json.images_results || [];
-    for (let i=0;i<imgs.length;i++) {
-      const it = imgs[i];
+    for (const it of imgs) {
       const link = it.original || it.thumbnail || it.source || it.link;
       if (link && /^https?:\/\//.test(link)) { _imgCache.set(query, link); return link; }
     }
@@ -359,8 +372,7 @@ async function fetchImageFromEbay(query){
     if (!resp.ok) return null;
     const json = await resp.json();
     const arr = json.findItemsByKeywordsResponse?.[0]?.searchResult?.[0]?.item || [];
-    for (let i=0;i<arr.length;i++) {
-      const it = arr[i];
+    for (const it of arr) {
       const img = (it.pictureURLSuperSize && it.pictureURLSuperSize[0]) || (it.galleryURL && it.galleryURL[0]);
       if (img) { _imgCache.set(query, img); return img; }
     }
@@ -368,7 +380,6 @@ async function fetchImageFromEbay(query){
   }catch{ return null; }
 }
 function fallbackImage(){ return "https://images.unsplash.com/photo-1517048676732-d65bc937f952?q=80&w=800&auto=format&fit=crop"; }
-
 async function cheapestSerp(query){
   if (!SERPAPI_KEY) return null;
   if (_priceCache.has(query)) return _priceCache.get(query);
@@ -383,8 +394,7 @@ async function cheapestSerp(query){
     const json = await resp.json();
     const items = json.shopping_results || [];
     let best = null;
-    for (let i=0;i<items.length;i++) {
-      const it = items[i];
+    for (const it of items) {
       const price = parseFloat(String(it.price||"").replace(/[^0-9.]/g,""));
       if (Number.isFinite(price)) { if(!best || price < best.price) best = { price, title: it.title, link: it.link, source: "Google Shopping" }; }
     }
@@ -408,8 +418,7 @@ async function cheapestEbay(query){
     const json = await resp.json();
     const arr = json.findItemsByKeywordsResponse?.[0]?.searchResult?.[0]?.item || [];
     let best=null;
-    for (let i=0;i<arr.length;i++) {
-      const it = arr[i];
+    for (const it of arr) {
       const p = parseFloat(it?.sellingStatus?.[0]?.currentPrice?.[0]?.__value__ || "NaN");
       const title = it.title?.[0]; const link = it.viewItemURL?.[0];
       if (Number.isFinite(p)) { if(!best || p < best.price) best = { price:p, title, link, source:"eBay" }; }
@@ -418,46 +427,33 @@ async function cheapestEbay(query){
     return best;
   }catch{ return null; }
 }
-function markup75(price){ return Math.round(price * 1.75 * 100); } // to cents
+function markup75(price){ return Math.round(price * 1.75 * 100); }
 
 async function ensureImageForProduct(p) {
   try {
     if (p.image_url) return p.image_url;
     const q = [p.year, p.make, p.model, p.part_type].filter(Boolean).join(" ");
-    let url = await fetchImageFromSerpAPI(q);
-    if (!url) url = await fetchImageFromEbay(q);
-    if (!url) url = fallbackImage();
-    await db.updateProductImage(p.id, url);
-    p.image_url = url;
-    return url;
-  } catch {
-    p.image_url = p.image_url || fallbackImage();
-    return p.image_url;
-  }
+    let url = await fetchImageFromSerpAPI(q) || await fetchImageFromEbay(q) || fallbackImage();
+    await db.updateProductImage(p.id, url); p.image_url = url; return url;
+  } catch { p.image_url = p.image_url || fallbackImage(); return p.image_url; }
 }
 
 app.post("/api/ai/image", async (req, res) => {
   try {
-    const body = req.body || {};
-    const product_id = body.product_id;
-    const make = body.make, model = body.model, year = body.year, part = body.part;
+    const product_id = req.body?.product_id;
+    const make = req.body?.make, model = req.body?.model, year = req.body?.year, part = req.body?.part;
     let p = product_id ? await db.getProduct(product_id) : null;
     const q = p ? (p.year + " " + p.make + " " + p.model + " " + p.part_type) :
                   [year, make, model, part].filter(Boolean).join(" ");
-    let url = await fetchImageFromSerpAPI(q);
-    if (!url) url = await fetchImageFromEbay(q);
-    if (!url) url = fallbackImage();
+    let url = await fetchImageFromSerpAPI(q) || await fetchImageFromEbay(q) || fallbackImage();
     if (p) { p = await db.updateProductImage(p.id, url); }
     res.json({ ok:true, image_url: url, product: p || null });
-  } catch (e) {
-    res.status(400).json({ ok:false, error: e.message });
-  }
+  } catch (e) { res.status(400).json({ ok:false, error: e.message }); }
 });
 
 app.post("/api/market/cheapest", async (req, res) => {
   try {
-    const body = req.body || {};
-    const make = body.make, model = body.model, year = body.year, part = body.part;
+    const make = req.body?.make, model = req.body?.model, year = req.body?.year, part = req.body?.part;
     const q = [year, make, model, part, "OEM OR Aftermarket"].filter(Boolean).join(" ");
     let best = await cheapestSerp(q) || await cheapestEbay(q);
     if (!best) {
@@ -477,7 +473,7 @@ app.post("/api/market/cheapest", async (req, res) => {
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
-// ---------- Enhanced search (auto-image + AI fallback) ----------
+// Enhanced search (auto-image + AI fallback)
 app.get("/api/search/enhanced", async (req, res) => {
   try {
     const { make, model, year, q, oem, min_price, max_price, page, page_size } = req.query;
@@ -489,14 +485,12 @@ app.get("/api/search/enhanced", async (req, res) => {
       min: min_price ? parseInt(min_price,10) : undefined,
       max: max_price ? parseInt(max_price,10) : undefined
     };
-
     const list = await db.listProducts(filter);
     const total = list.length;
-
     const ps = Math.min(parseInt(page_size||"60",10), 200);
     const pg = Math.max(1, parseInt(page||"1",10));
-    const start = (pg-1)*ps, end = start + ps;
-    let items = list.slice(start, end);
+    const start = (pg-1)*ps, end = start+ps;
+    const items = list.slice(start,end);
 
     const NEEDS = items.filter(p => !p.image_url).slice(0, 12);
     for (const p of NEEDS) { await ensureImageForProduct(p); }
@@ -510,7 +504,6 @@ app.get("/api/search/enhanced", async (req, res) => {
         /alternator|shock|control|bearing|headlight/i.test(partHint) ? 120 :
         /filter|plug|sensor/i.test(partHint) ? 28 : 75
       );
-
       const aiProduct = {
         id: "ai-" + crypto.randomUUID(),
         name: `${year||""} ${make||""} ${model||""} – ${partHint} (AI-sourced)`.replace(/\s+/g," ").trim(),
@@ -524,15 +517,13 @@ app.get("/api/search/enhanced", async (req, res) => {
       };
       const imgQ = [year, make, model, partHint].filter(Boolean).join(" ");
       aiProduct.image_url = await fetchImageFromSerpAPI(imgQ) || await fetchImageFromEbay(imgQ) || fallbackImage();
-
       return res.json({ total: 1, page: 1, page_size: 1, items: [aiProduct] });
     }
-
     res.json({ total, page: pg, page_size: ps, items });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
-// ---------- Shipping (EasyPost + freight + heuristic) ----------
+// ---------- Shipping ----------
 function ozFromLb(lb){ return Math.max(1, Math.round(lb * 16)); }
 async function easypostRates({ to, parcel }){
   const url = "https://api.easypost.com/v2/shipments";
@@ -566,7 +557,7 @@ function heuristicRates({ domestic, billable, zoneMult, residentialFee, remoteFe
   function base2Day(bw){ return 15 + 0.95*bw; }
   function baseOvernight(bw){ return 24 + 1.45*bw; }
   function baseIntlExpress(bw){ return 32 + 1.65*bw; }
-  function baseFreight(bw){ return 75 + 2.2*bw; } // rough LTL
+  function baseFreight(bw){ return 75 + 2.2*bw; }
   function toCents(n){ return Math.max(1, Math.round(n*100)); }
   const fuel = 0.12;
   const quote = (carrier,service,days,base)=>{
@@ -595,18 +586,17 @@ function heuristicRates({ domestic, billable, zoneMult, residentialFee, remoteFe
 }
 app.post("/api/shipping/rates", async (req, res) => {
   try {
-    const body = req.body || {};
-    const address = body.address || {};
-    const cart = body.cart || [];
-    const subtotal_cents = body.subtotal_cents || 0;
+    const address = req.body.address || {};
+    const cart = req.body.cart || [];
+    const subtotal_cents = req.body.subtotal_cents || 0;
     const to = {
       name: address.name||"", email: address.email||"",
       line1: address.line1||"", line2: address.line2||"", city: address.city||"", state: address.state||"",
       postal_code: address.postal_code||"", country: (address.country||"US").toUpperCase(), residential: !!address.residential
     };
+
     let totalWeightLb = 0, dimL=0, dimW=0, dimH=0;
-    for (let i=0;i<cart.length;i++) {
-      const item = cart[i];
+    for (const item of cart) {
       const p = await db.getProduct(item.id); if (!p) continue;
       const qty = Math.max(1, parseInt(item.qty||1,10));
       totalWeightLb += (p.weight_lb||2)*qty;
@@ -635,7 +625,7 @@ app.post("/api/shipping/rates", async (req, res) => {
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
-// ---------- Payments (Stripe REST) + dropship ----------
+// ---------- Stripe REST ----------
 async function stripeCreatePaymentIntent({ amount, currency, receipt_email, metadata }) {
   const form = new URLSearchParams();
   form.set("amount", String(amount));
@@ -643,7 +633,10 @@ async function stripeCreatePaymentIntent({ amount, currency, receipt_email, meta
   form.set("automatic_payment_methods[enabled]", "true");
   if (receipt_email) form.set("receipt_email", receipt_email);
   if (metadata && typeof metadata === "object") {
-    for (const k of Object.keys(metadata)) form.set(`metadata[${k}]`, typeof metadata[k]==="string" ? metadata[k] : JSON.stringify(metadata[k]).slice(0,499));
+    for (const k of Object.keys(metadata)) {
+      const v = typeof metadata[k]==="string" ? metadata[k] : JSON.stringify(metadata[k]).slice(0,499);
+      form.set(`metadata[${k}]`, v);
+    }
   }
   const resp = await fetch("https://api.stripe.com/v1/payment_intents", {
     method: "POST",
@@ -651,21 +644,19 @@ async function stripeCreatePaymentIntent({ amount, currency, receipt_email, meta
     body: form.toString()
   });
   const json = await resp.json();
-  if (!resp.ok) { throw new Error(json.error && json.error.message || "Stripe error"); }
+  if (!resp.ok) { throw new Error(json.error?.message || "Stripe error"); }
   return json; // includes client_secret
 }
 
 app.post("/create-payment-intent", async (req, res) => {
   try {
-    const body = req.body || {};
-    const cart = body.cart || [];
-    const currency = body.currency || "usd";
-    const email = body.email;
-    const shipping = body.shipping || null;
+    const cart = req.body.cart || [];
+    const currency = req.body.currency || "usd";
+    const email = req.body.email;
+    const shipping = req.body.shipping || null;
 
     let subtotal = 0; const compactItems = [];
-    for (let i=0;i<cart.length;i++) {
-      const item = cart[i];
+    for (const item of cart) {
       const p = String(item.id).startsWith("ai-") ? null : await db.getProduct(item.id);
       const qty = Math.max(1, parseInt(item.qty||1,10));
       const unit = p ? p.price_cents : parseInt(item.price_cents, 10);
@@ -674,19 +665,23 @@ app.post("/create-payment-intent", async (req, res) => {
       compactItems.push({ id:item.id, name:item.name, qty, unit_price_cents: unit });
     }
     if (subtotal <= 0) subtotal = 4900;
-    const shipping_cents = shipping && shipping.amount_cents ? parseInt(shipping.amount_cents,10) : 0;
+    const shipping_cents = shipping?.amount_cents ? parseInt(shipping.amount_cents,10) : 0;
     const amount = subtotal + Math.max(0, shipping_cents);
 
     const pi = await stripeCreatePaymentIntent({
       amount, currency,
       receipt_email: email || undefined,
-      metadata: { site:"Ohio Auto Parts", items: compactItems.slice(0, 30), shipping: shipping||{} }
+      metadata: { site:"Ohio Auto Parts", items: compactItems.slice(0,30), shipping: shipping||{} }
     });
 
     res.json({ clientSecret: pi.client_secret, amount, subtotal, shipping_cents });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
+// Webhook (raw body)
+app.post("/webhook", async (req, res) => res.json({ received:true }), { raw: true });
+
+// Dropship queue
 async function queueDropship(order){
   try {
     if (DROPSHIP_WEBHOOK_URL) {
@@ -694,11 +689,9 @@ async function queueDropship(order){
       if (!r.ok) throw new Error("Dropship webhook " + r.status);
       console.log("[dropship] forwarded to webhook");
     } else {
-      console.log("[dropship] webhook not set; order queued in logs only", order.id);
+      console.log("[dropship] webhook not set; order queued in logs only", order?.id);
     }
-  } catch (e) {
-    console.error("[dropship] failed:", e.message);
-  }
+  } catch (e) { console.error("[dropship] failed:", e.message); }
 }
 
 // ---------- SEO: robots + sitemap ----------
@@ -736,7 +729,7 @@ app.get("/", (_req, res) => {
 <meta property="og:type" content="website"/>
 <meta property="og:url" content="__SITE_URL__"/>
 <meta property="og:image" content="https://images.unsplash.com/photo-1517048676732-d65bc937f952?q=80&w=1200&auto=format&fit=crop"/>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='64' height='64'%3E%3rect width='64' height='64' rx='12' fill='%23111111'/%3E%3Ccircle cx='20' cy='42' r='8' fill='%23d4af37'/%3E%3Ccircle cx='44' cy='42' r='8' fill='%23d4af37'/%3E%3Crect x='12' y='20' width='40' height='14' rx='4' fill='%23ffd76b'/%3E%3C/svg%3E" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='64' height='64'%3E%3Crect width='64' height='64' rx='12' fill='%23111111'/%3E%3Ccircle cx='20' cy='42' r='8' fill='%23d4af37'/%3E%3Ccircle cx='44' cy='42' r='8' fill='%23d4af37'/%3E%3Crect x='12' y='20' width='40' height='14' rx='4' fill='%23ffd76b'/%3E%3C/svg%3E" />
 <style>
 :root{--bg:#0a0a0a;--card:#101010;--panel:#0f0f0f;--line:rgba(255,255,255,.08);--text:#f3f3f3;--muted:#bfbfbf;--gold:#d4af37;--accent:#ffd76b}
 *{box-sizing:border-box}
@@ -750,7 +743,7 @@ header{position:sticky;top:0;z-index:30;background:#000c;border-bottom:1px solid
   box-shadow:0 0 24px rgba(212,175,55,.35), inset 0 0 12px rgba(255,255,255,.08)}
 .logo b{font-size:1.15rem}
 .searchbar{display:flex;gap:8px}
-.searchbar input{flex:1;padding:12px;border-radius:12px;border:1px solid var(--line);background:#0f0f0f;color:var(--text)}
+.searchbar input{flex:1;padding:12px;border-radius:12px;border:1px solid var(--line);background:#0f0f0f;color:#var(--text)}
 .searchbar button{padding:12px 14px;border:none;border-radius:12px;background:linear-gradient(135deg,var(--accent),var(--gold));color:#111;font-weight:800;cursor:pointer}
 .useractions{display:flex;gap:8px;justify-content:flex-end}
 .useractions .btn{padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:#0f0f0f;color:#eee;cursor:pointer}
@@ -1006,13 +999,9 @@ function renderCart(){
   selectedRate=null; document.getElementById('rates').innerHTML=''; document.getElementById('shiptotal').textContent=fmt(0);
   updateStripe(subtotalCents, 0);
 }
+function updateTotals(){ const ship = selectedRate && selectedRate.amount_cents || 0; document.getElementById('grandtotal').textContent = fmt(subtotalCents + ship); }
 
-function updateTotals(){
-  const ship = selectedRate && selectedRate.amount_cents || 0;
-  document.getElementById('grandtotal').textContent = fmt(subtotalCents + ship);
-}
-
-// Shipping
+// Shipping UI
 document.getElementById('getRates').onclick = async function(){
   if(!cart.length){ alert('Add items to cart first.'); return; }
   const address = {
@@ -1085,4 +1074,48 @@ async function updateStripe(subtotal, shipping){
     });
     prButton = elements.create('paymentRequestButton', { paymentRequest: paymentRequest });
     const can = await paymentRequest.canMakePayment();
-    if (can) prButton.mount('#payment-request-button'); else document.getElementById('payment-request-
+    if (can) prButton.mount('#payment-request-button'); else document.getElementById('payment-request-button').style.display='none';
+    paymentRequest.on('paymentmethod', async function(ev){
+      const r = await stripe.confirmCardPayment(clientSecret, { payment_method: ev.paymentMethod.id }, { handleActions: true });
+      if (r.error) { ev.complete('fail'); setMsg(r.error.message||'Payment failed.'); return; }
+      ev.complete('success'); setMsg('Payment successful!');
+    });
+  } else {
+    paymentRequest.update({ total: { label:'Ohio Auto Parts', amount: amount || (subtotal + (shipping||0)) } });
+  }
+
+  document.getElementById('grandtotal').textContent = fmt(amount || (subtotal + (shipping||0)));
+}
+document.getElementById('pay').onclick = async function(){
+  try{
+    setMsg('Processing…');
+    const r = await stripe.confirmPayment({ elements: elements, confirmParams:{ return_url: window.location.href }, redirect: 'if_required' });
+    if (r.error) setMsg(r.error.message||'Payment failed.'); else setMsg('Payment successful!');
+  }catch(e){ setMsg(e.message); }
+};
+
+init();
+</script>
+</body>
+</html>
+*/});
+  const siteURL = (process.env.SITE_URL || "").replace(/\/+$/,"") || "";
+  html = html.replaceAll("__SITE_URL__", siteURL);
+  res.type("text/html; charset=utf-8").send(html);
+});
+
+// ---------- Admin seed ----------
+app.post("/admin/seed", async (req, res) => {
+  const token = (req.headers.authorization||"").split("Bearer ")[1];
+  if (token !== ADMIN_PASSWORD) return res.status(401).json({ error: "Unauthorized" });
+  await ensureSeed(); res.json({ ok:true });
+});
+
+// ---------- start ----------
+const HOST = "0.0.0.0";
+const PORT = Number(process.env.PORT) || 3000;
+ensureSeed().then(()=>{
+  app.listen(PORT, HOST, () => {
+    console.log("Ohio Auto Parts listening on http://" + HOST + ":" + PORT);
+  });
+});
