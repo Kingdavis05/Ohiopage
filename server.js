@@ -1,3 +1,8 @@
+function heredoc(fn) {
+  return String(fn)
+    .replace(/^[^{]*{\s*\/\*!?/, "")
+    .replace(/\*\/\s*}\s*$/, "");
+}
 // server.js
 // Ohio Auto Parts – all-in-one (eBay-style UI + VIN modal + 1991–2026 years + cart/checkout + full results + AI image & cheapest + dropship queue)
 
